@@ -5,6 +5,12 @@ __pycache__/
 venv/
 env/
 
+# ── Build / packaging outputs ───────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.spec
+
 # ── ECU flash images & backups — PRIVACY / RESEARCH-ONLY ────────────────
 # Full ROM dumps contain the VIN (file offset 0x5D07) and the ECU/CAL IDs.
 # Never commit flash images, dumps, or backups to this repo.
