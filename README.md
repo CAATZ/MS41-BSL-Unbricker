@@ -39,7 +39,7 @@ normal diagnostic flash path can't help.
 
 ## Hardware setup
 
-The connections below are made at the DME PCB test points shown here:
+The connections below are made at the DME PCB test points shown here (The image was upscaled using AI, so the text on the ICs got obliterated, I apologize for that):
 
 ![MS41 DME PCB — test points for the serial tap, BSL-entry straps, reset, and 12V](images/PCB_TP.PNG)
 
