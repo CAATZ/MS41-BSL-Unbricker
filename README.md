@@ -131,6 +131,26 @@ Run `python bsl_unbrick.py --help` for the full option list.
 
 ---
 
+## Acknowledgements
+
+This tool stands on public hardware documentation and prior community work:
+
+- **Infineon / Siemens** — the *SAB 80C166* datasheet and the *80C166 Bootstrap Loader*
+  application note: the BSL entry sequence, ASC0 serial protocol, and the half-duplex caveat.
+- **Intel** — the *28F200BX* flash datasheet: the command set (erase / program / Read-ID),
+  block map, status register, and identifier codes.
+- **[RomRaider](https://www.romraider.com/)** — MS41 ROM definitions and community reverse
+  engineering, used for variant / CAL-ID identification and the checksum-disable control bits.
+- **[Siemens_MS41_Checksum](https://github.com/kimfreding/Siemens_MS41_Checksum)** (kimfreding)
+  and **[pyms41](https://github.com/OpenMS41/pyms41)** (jpiccari) — the MS41 CRC-16 checksum
+  work that `ms41_checksum.py` builds on.
+- **[Siemens-MS41](https://github.com/ba114/Siemens-MS41)** (ba114) — MS41 reverse-engineering ECU definitions.
+- **[c166-ghidra-module](https://github.com/keyhana/c166-ghidra-module)** (keyhana) — the C166
+  SLEIGH processor module for **[Ghidra](https://github.com/NationalSecurityAgency/ghidra)**,
+  used to disassemble and assemble the RAM monitor and the 0xFA40 stubs.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE). (Set the copyright holder line in `LICENSE` before publishing.)

@@ -1,6 +1,9 @@
 """
 ms41_checksum.py — BMW MS41 ROM checksum verification + correction (offline, from a .bin).
 
+The CRC-16 algorithm builds on the Siemens_MS41_Checksum and pyms41 projects, verified
+byte-for-byte against real dumps.
+
 There are THREE checksum systems in a 256 KB MS41 image, all CRC-16 (poly 0xA001,
 reflected, table-driven), computed directly on FILE offsets, stored little-endian:
 
