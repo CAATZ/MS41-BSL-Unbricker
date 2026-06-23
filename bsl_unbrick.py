@@ -1,0 +1,1213 @@
+#!/usr/bin/env python3
+"""
+MS41 (SAB 80C166) Bootstrap-Loader (BSL) unbrick tool.
+
+The 80C166 has a built-in BSL in CPU silicon, so it works even when the flash
+is corrupt/unbootable.  Sequence (from the SAB80C166 datasheet):
+
+  1. Force BSL entry IN HARDWARE: at the end of a hardware reset, ALE must be
+     sampled HIGH and NMI# must be active (LOW).
+        ALE   = CPU pin 25
+        NMI#  = CPU pin 29   (hold low)
+        RSTIN#= CPU pin 27   (pulse to reset)
+     Practically: pull NMI# (pin 29) to GND, tie/pull ALE (pin 25) high, then
+     pulse RSTIN# (pin 27) low->high.  Release NMI# after reset if you like.
+  2. The BSL scans RXD0 for a 0x00 byte, measures its bit time (auto-baud),
+     and replies 0x55 on TXD0.
+  3. The next 32 bytes are stored at 0xFA40-0xFA5F (internal RAM); the BSL then
+     jumps to 0xFA40 and runs them.
+
+Serial path: a direct full-duplex tap on ASC0 = TXD0 (P3.10) -> host RX and
+host TX -> RXD0 (P3.11), via an FT232.  (The Siemens BSL app-note warns against
+half-duplex / single-wire K-line, so this tool only supports the direct tap.)
+
+The whole 28F200 (boot, program, cal) is in-circuit erasable/programmable/verifiable
+over BSL — no bench programmer.  Everyday use is the `flash` command:
+
+  flash <region|all> --ref <image> --arm   (DRY-RUN without --arm; needs 12V VPP)
+
+Other commands: `sync` (confirm BSL entry + that loaded code runs), `dump` (read the
+chip to a .bin), `read`/`write`, `verify-alias`, `vpp-on`, `businfo`.  The low blocks
+(CPU 0x0-0x7FFF) are BSL-shadowed and auto-routed through a +0x40000 wrap-around alias;
+the GAL maps flash A13 = !CPU A14, so a file-order .bin = CPU image XOR 0x4000.
+"""
+import sys
+import time
+import argparse
+
+try:
+    import serial
+    from serial.tools import list_ports as _list_ports
+except ImportError:
+    serial = None
+
+try:
+    from ms41_variant import MS41ECU            # bundled MS41 variant / CAL-ID detection (see ms41_variant.py)
+except ImportError:
+    MS41ECU = None
+
+try:
+    import ms41_checksum as cks                 # bundled MS41 checksum verify/correct (see ms41_checksum.py)
+except ImportError:
+    cks = None
+
+__version__ = "1.0.0"                   # bump on each release; tag the commit v<version> (see CHANGELOG.md)
+
+CAL_PARTIAL_SIZE = 24 * 1024           # a 24KB cal/tune partial (DS2 0x10000.., CPU-order)
+_SERIAL_ERRS = (serial.SerialException,) if serial else ()   # for top-level FT232 handling
+
+
+def _make_bar(label):
+    """Return a progress callback cb(done, total) that draws a one-line '\\r' bar for a long
+    transfer — or None if stdout isn't a TTY (so redirected/piped output isn't spammed).
+    The caller (mon_read/mon_program) writes the closing newline when the transfer ends."""
+    if not sys.stdout.isatty():
+        return None
+    t0 = time.time()
+
+    def cb(done, total):
+        w = 24
+        frac = (done / total) if total else 1.0
+        fill = int(w * frac)
+        el = time.time() - t0
+        rate = done / el if el > 0 else 0
+        eta = (total - done) / rate if rate > 0 else 0
+        sys.stdout.write(f"\r  {label:<11}[{'#' * fill}{'.' * (w - fill)}] {frac * 100:3.0f}% "
+                         f"{done // 1024:>3}/{total // 1024 or 1} KB  {rate / 1024:4.1f} KB/s "
+                         f"ETA {eta:3.0f}s ")
+        sys.stdout.flush()
+    return cb
+
+
+class BSLError(Exception):
+    pass
+
+
+class BSL:
+    LOAD_ADDR = 0xFA40          # BSL loads 32 bytes here and jumps
+    SYNC_BYTE = 0x00           # host -> ECU (auto-baud reference)
+    ACK_BYTE  = 0x55           # ECU -> host (BSL acknowledge)
+
+    def __init__(self, port, baud=9600, timeout=2.0,
+                 reset_line=None, reset_hold=0.02, reset_settle=0.015, reset_invert=False):
+        if serial is None:
+            raise BSLError("pyserial not installed (pip install pyserial)")
+        self.baud = baud
+        self.port = port
+        self.timeout = timeout
+        self.reset_line = reset_line          # None | "rts" | "dtr": FTDI output that drives RSTIN#
+        self.reset_hold = reset_hold          # s to hold reset asserted
+        self.reset_settle = reset_settle      # s to wait after release before sync
+        self.reset_invert = reset_invert      # flip polarity (transistor/inverter in the path)
+        self.ser = serial.Serial(
+            port, baud, bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
+            timeout=timeout)
+        if self.reset_line:                   # don't leave the CPU held in reset on open
+            try:
+                self._drive_reset(False)
+            except Exception as e:
+                print(f"  WARN: could not set {self.reset_line.upper()} ({e})")
+
+    # ── low level ──────────────────────────────────────────────────────────
+    def _read(self, n, deadline):
+        out = bytearray()
+        while len(out) < n and time.time() < deadline:
+            b = self.ser.read(n - len(out))
+            if b:
+                out += b
+        return bytes(out)
+
+    # ── optional FTDI-driven CPU reset (auto BSL entry) ────────────────────
+    def _drive_reset(self, assert_reset):
+        # pyserial True 'asserts' the line -> FTDI RTS#/DTR# pin goes LOW.  RSTIN# is
+        # active-low, so assert_reset=True => pin LOW => held in reset (no invert).
+        lvl = bool(assert_reset) ^ bool(self.reset_invert)
+        if self.reset_line == "rts":
+            self.ser.rts = lvl
+        elif self.reset_line == "dtr":
+            self.ser.dtr = lvl
+
+    def pulse_reset(self, log=print):
+        """Pulse RSTIN# via the chosen FTDI output so the CPU re-enters BSL with no
+        hands: ALE-high + NMI#-low are static straps, and the RSTIN# rising edge
+        latches BSL mode.  No-op unless --reset-line was given."""
+        if not self.reset_line:
+            return
+        log(f"reset: pulsing RSTIN# via {self.reset_line.upper()} "
+            f"(hold {self.reset_hold * 1000:.0f}ms, settle {self.reset_settle * 1000:.0f}ms"
+            f"{', inverted' if self.reset_invert else ''})")
+        self._drive_reset(True)                 # hold CPU in reset
+        time.sleep(self.reset_hold)
+        self.ser.reset_input_buffer()           # drop the reset-transient noise
+        self._drive_reset(False)                # release -> CPU samples straps -> BSL
+        time.sleep(self.reset_settle)
+
+    def _reopen(self, log=print):
+        """Close and reopen the port — recovers an FT232 that Windows USB selective-suspend put
+        to sleep, or that wedged after a long idle (a clean reopen re-inits the device)."""
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+        time.sleep(0.3)
+        self.ser = serial.Serial(self.port, self.baud, bytesize=serial.EIGHTBITS,
+                                 parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE,
+                                 timeout=self.timeout)
+        if self.reset_line:
+            try:
+                self._drive_reset(False)
+            except Exception:
+                pass
+        log("  FT232 port reopened.")
+
+    # ── BSL entry handshake ────────────────────────────────────────────────
+    def sync(self, log=print):
+        """Send 0x00, wait for the BSL's 0x55.  Returns True on success.
+
+        Safe to call repeatedly.  If this never returns True, the ECU is not in
+        BSL mode (check ALE/NMI/RSTIN wiring) or the serial path is wrong.
+        """
+        self.pulse_reset(log)                   # auto-reset into BSL if --reset-line set
+        try:
+            self.ser.reset_input_buffer()
+            self.ser.write(bytes([self.SYNC_BYTE]))
+            self.ser.flush()
+        except serial.SerialException as e:     # FT232 wedged/suspended -> reopen + retry once
+            log(f"  serial write stalled ({e.__class__.__name__}: {e}) — reopening the FT232…")
+            self._reopen(log)
+            self.pulse_reset(log)
+            self.ser.reset_input_buffer()
+            self.ser.write(bytes([self.SYNC_BYTE]))
+            self.ser.flush()
+        deadline = time.time() + 3.0
+        saw = bytearray()
+        while time.time() < deadline:
+            b = self.ser.read(1)
+            if not b:
+                continue
+            saw += b
+            if b[0] == self.ACK_BYTE:
+                log(f"BSL sync OK — got 0x55 (raw: {saw.hex(' ')})")
+                return True
+            # keep reading past any line noise until the 0x55 (or the timeout)
+        log(f"No 0x55 within 3 s (raw: {saw.hex(' ') or '<nothing>'})")
+        if saw and getattr(self, "baud", 9600) > 19200:
+            log("  hint: a non-empty garbled reply usually means the bootstrap auto-baud "
+                "can't lock this high — drop to --speed mid (19200) or slow (9600).")
+        return False
+
+    # ── load and run a 0xFA40 stub ─────────────────────────────────────────
+    def load_stub(self, stub: bytes):
+        """Send the 32-byte BSL payload.  The ECU stores it at 0xFA40 and jumps.
+
+        `stub` may be <=32 bytes; it is zero-padded to exactly 32.
+        """
+        if len(stub) > 32:
+            raise BSLError(f"stub is {len(stub)} bytes; BSL accepts only 32")
+        frame = bytes(stub).ljust(32, b"\x00")
+        self.ser.reset_input_buffer()
+        self.ser.write(frame)
+        self.ser.flush()
+        # ECU is now executing at 0xFA40
+
+    def read(self, n, timeout=2.0):
+        return self._read(n, time.time() + timeout)
+
+    def write(self, data: bytes):
+        self.ser.write(bytes(data))
+        self.ser.flush()
+
+    # ── load + drive the RAM monitor ───────────────────────────────────────
+    def start_monitor(self, log=print, flash=False):
+        """sync -> load the 32-byte preloader -> feed it the monitor -> ping.
+
+        The preloader (loaded by the BSL at 0xFA40) reads exactly MONITOR_LOAD_LEN
+        bytes into IRAM 0xFA60 then jumps there.  Returns True if the monitor
+        answers a ping with 0xA5.  flash=True loads MONITOR_FLASH (P/R/E/F) instead
+        of the general MONITOR (P/R/W/C) — same preloader, same 0xFA60 entry.
+        """
+        if not self.sync(log):
+            return False
+        log("loading preloader…")
+        self.load_stub(PRELOADER)                 # 32-byte BSL frame; BSL jumps to it
+        time.sleep(0.05)
+        mon = MONITOR_FLASH if flash else MONITOR
+        frame = bytes(mon).ljust(MONITOR_LOAD_LEN, b"\x00")
+        log(f"loading {'FLASH ' if flash else ''}monitor ({len(mon)} B, padded to {MONITOR_LOAD_LEN})…")
+        self.ser.reset_input_buffer()
+        self.ser.write(frame)
+        self.ser.flush()
+        time.sleep(0.05)
+        return self.mon_ping(log)
+
+    def mon_ping(self, log=print):
+        self.ser.reset_input_buffer()
+        self.ser.write(b"P")
+        self.ser.flush()
+        r = self.read(1, timeout=1.0)
+        ok = (r == b"\xa5")
+        log(f"monitor ping -> {r.hex() or '<nothing>'} ({'OK' if ok else 'FAIL'})")
+        return ok
+
+    def mon_read(self, addr, length, progress=None):
+        """Read `length` bytes from 24-bit `addr` via the monitor 'R' command.
+
+        Each 'R' sets DPP0 to a 16KB page and reads within it, so we chunk on 16KB
+        boundaries (page = addr>>14, in-page offset = addr & 0x3FFF).  With a `progress`
+        callback we sub-chunk to 4KB so the bar advances smoothly."""
+        out = bytearray()
+        total = length
+        cap = 4096 if progress else 0x4000
+        while length > 0:
+            page = (addr >> 14) & 0xFFFF
+            off = addr & 0x3FFF
+            n = min(length, 0x4000 - off, cap)    # stay inside the DPP0 16KB window
+            cmd = bytes([0x52, page & 0xFF, (page >> 8) & 0xFF,
+                         off & 0xFF, (off >> 8) & 0xFF, n & 0xFF, (n >> 8) & 0xFF])
+            self.ser.reset_input_buffer()
+            self.ser.write(cmd)
+            self.ser.flush()
+            chunk = self.read(n, timeout=2.0 + n * 0.002)
+            out += chunk
+            if progress:
+                progress(len(out), total)
+            if len(chunk) < n:                    # short read -> stop
+                break
+            addr += n
+            length -= n
+        if progress:
+            sys.stdout.write("\n"); sys.stdout.flush()
+        return bytes(out)
+
+    def mon_write(self, addr, data):
+        """Write `data` to 24-bit `addr` via the monitor 'W' command (RAM/SFR).
+        Returns True if every 16KB chunk is ACKed with 'K'."""
+        data = bytes(data)
+        i = 0
+        while i < len(data):
+            page = (addr >> 14) & 0xFFFF
+            off = addr & 0x3FFF
+            n = min(len(data) - i, 0x4000 - off)  # stay inside the DPP0 16KB window
+            cmd = bytes([0x57, page & 0xFF, (page >> 8) & 0xFF,
+                         off & 0xFF, (off >> 8) & 0xFF, n & 0xFF, (n >> 8) & 0xFF]) + data[i:i + n]
+            self.ser.reset_input_buffer()
+            self.ser.write(cmd)
+            self.ser.flush()
+            ack = self.read(1, timeout=2.0)
+            if ack != b"\x4b":                     # 'K'
+                return False
+            addr += n
+            i += n
+        return True
+
+    def mon_dump(self, start, end, log=print, alias_low=False, fill_hole=True):
+        """Read physical [start,end) via the monitor in 16KB-aligned chunks; a short
+        read is 0xFF-filled.  In BSL mode 0x0-0x7FFF normally returns the bootstrap-ROM
+        shadow (fa 00 00 01…), not the flash; with alias_low=True those chunks are read
+        through the +BSL_ALIAS wrap-around so they return the REAL flash.  fill_hole
+        0xFF-fills the BSL_HOLE range (unmapped — a raw read floats to an address-ramp;
+        true content is 0xFF, matching original/stock dumps).  Returns the bytes
+        (indexed by the requested physical address, not the alias)."""
+        out = bytearray()
+        addr = start
+        while addr < end:
+            nxt = min((addr & ~0x3FFF) + 0x4000, end)   # to next 16KB boundary or end
+            n = nxt - addr
+            ra = addr + BSL_ALIAS if (alias_low and addr < BSL_SHADOW_HI) else addr
+            data = bytearray(self.mon_read(ra, n))
+            if len(data) < n:
+                log(f"  0x{addr:05X}: short read {len(data)}/{n} -> 0xFF fill (reserved?)")
+                data += b"\xff" * (n - len(data))
+            note = (f"  (via alias 0x{ra:05X})" if ra != addr else "")
+            if fill_hole:                               # 0xFF-fill the unmapped floating hole
+                h0, h1 = max(addr, BSL_HOLE[0]), min(nxt, BSL_HOLE[1])
+                if h0 < h1:
+                    data[h0 - addr:h1 - addr] = b"\xff" * (h1 - h0)
+                    note += f"  (0xFF-filled unmapped 0x{h0:05X}-0x{h1 - 1:05X})"
+            out += data
+            log(f"  dumped 0x{addr:05X}..0x{nxt - 1:05X}" + note)
+            addr = nxt
+        return bytes(out)
+
+    def mon_call(self, addr, timeout=3.0):
+        """Call a segment-0 routine at 16-bit `addr` via the monitor 'C' command.
+        The routine MUST end in RET.  Returns True if the monitor replies 'D' (0x44)."""
+        cmd = bytes([0x43, addr & 0xFF, (addr >> 8) & 0xFF])
+        self.ser.reset_input_buffer()
+        self.ser.write(cmd)
+        self.ser.flush()
+        return self.read(1, timeout=timeout) == b"\x44"
+
+    def mon_erase(self, addr, timeout=30.0, log=print):
+        """Erase the 28F200 block containing 24-bit `addr` via the 'E' command
+        (0x20 setup / 0xD0 confirm / poll SR.7 with a nested timeout / 0xFF read-array).
+        Returns the final 28F200 status byte, or None on no reply.  Decode:
+          SR.7 (0x80)=1 ready (0=timed-out/busy), SR.5 (0x20)=1 erase error,
+          SR.3 (0x08)=1 VPP low.  Needs 12V on VPP.  timeout must exceed the monitor's
+          own poll budget (~8s) so a rejected/slow erase returns a real SR, not None."""
+        page = (addr >> 14) & 0xFFFF
+        off = addr & 0x3FFF
+        cmd = bytes([0x45, page & 0xFF, (page >> 8) & 0xFF, off & 0xFF, (off >> 8) & 0xFF])
+        self.ser.reset_input_buffer()
+        self.ser.write(cmd)
+        self.ser.flush()
+        sr = self.read(1, timeout=timeout)
+        return sr[0] if sr else None
+
+    # C166 port SFRs (Pn register, DPn direction) and their bit-addressable offsets
+    # (SAB80C166 datasheet: P2=0xFFC0/E0, DP2=0xFFC2/E1, P3=0xFFC4/E2, DP3=0xFFC6/E3).
+    _PORT_SFR = {2: (0xFFC0, 0xFFC2), 3: (0xFFC4, 0xFFC6)}
+    _BITOFF   = {2: (0xE0, 0xE1), 3: (0xE2, 0xE3)}   # (Pn bitoff, DPn bitoff)
+    _VPP_SCRATCH = 0xFC80                             # free IRAM for the bit-op routine
+
+    def set_vpp(self, on, pins, log=print):
+        """Switch the VPP-gate port bit(s) on/off.  The C166 will NOT write SFRs via the
+        monitor's indirect 'W' (HW-confirmed: reads work, writes don't stick), so instead
+        we BUILD a routine of DIRECT bit ops (bset/bclr DPn.b + Pn.b — the addressing the
+        firmware uses), load it to scratch IRAM via 'W' (IRAM writes DO work), and run it
+        via 'C'.  bset=(bit<<4)|0xF, bclr=(bit<<4)|0xE.  Reads each Pn back to report the
+        result.  Needs a monitor with W+C (the general MONITOR), not the flash monitor."""
+        rtn = bytearray()
+        for port, bit in pins:
+            p_off, dp_off = self._BITOFF[port]
+            if on:
+                rtn += bytes([(bit << 4) | 0x0F, dp_off])   # bset DPn.bit  (-> output)
+                rtn += bytes([(bit << 4) | 0x0F, p_off])    # bset Pn.bit   (-> high)
+            else:
+                rtn += bytes([(bit << 4) | 0x0E, p_off])    # bclr Pn.bit   (-> low)
+        rtn += bytes([0xCB, 0x00])                          # ret
+        if not self.mon_write(self._VPP_SCRATCH, bytes(rtn)):
+            log("  VPP: routine load (W) not ACKed — monitor has no W?"); return False
+        if not self.mon_call(self._VPP_SCRATCH):
+            log("  VPP: routine call (C) didn't return — monitor has no C, or bad routine.")
+            return False
+        for port, bit in pins:                              # read each port back (mon_read works on SFRs)
+            v = self.mon_read(self._PORT_SFR[port][0], 2)
+            val = (v[0] | (v[1] << 8)) if len(v) == 2 else None
+            set_ = (val is not None) and bool(val & (1 << bit))
+            log(f"  VPP {'ON ' if on else 'OFF'}: P{port}.{bit} routine ran; read-back "
+                f"P{port}=0x{(val or 0):04X} bit{bit}={'1' if set_ else '0'}"
+                + ("" if set_ == on else "  (pin may be clamped by its load — trust the meter at VPP)"))
+        return True
+
+    def mon_read_id(self, log=print):
+        """Read the 28F200 manufacturer + device ID via the Read-Identifier routine — loaded to
+        IRAM scratch with 'W' and launched with 'C' (the general monitor; this needs W+C, like
+        set_vpp).  The routine enables WR#, writes 0x90, reads chip words 0/1 through the
+        +0x40000 alias, writes 0xFF (read-array), and stashes the two ID words at 0xFCC0.
+        Non-destructive (no VPP).  Returns (manufacturer, device) or (None, None) on failure."""
+        if not self.mon_write(self._VPP_SCRATCH, READ_ID_ROUTINE):     # load to 0xFC80
+            log("  read-id: routine load (W) not ACKed — monitor has no W?"); return None, None
+        if not self.mon_call(self._VPP_SCRATCH):                       # run it
+            log("  read-id: routine call (C) didn't return — monitor has no C, or bad routine.")
+            return None, None
+        res = self.mon_read(0xFCC0, 4)                                 # mfr (LE) + device (LE)
+        if len(res) < 4:
+            return None, None
+        return res[0] | (res[1] << 8), res[2] | (res[3] << 8)
+
+    def mon_program(self, addr, data, log=print, progress=None):
+        """Program `data` to flash at 24-bit `addr` via the 'F' command (28F200
+        word-program: per word 0x40 / data word / poll SR.7).  Chunks on 16KB DPP0
+        pages; `addr` and every chunk length stay word-aligned (even).  With a
+        `progress` callback we sub-chunk to 4KB for a smooth bar.  Returns True iff
+        every chunk is ACKed 'K'.  Needs 12V on VPP/RP#."""
+        data = bytes(data)
+        if (addr & 1) or (len(data) & 1):
+            raise ValueError("flash program needs an even addr and length (16-bit words)")
+        i = 0
+        total = len(data)
+        cap = 4096 if progress else 0x4000
+        while i < len(data):
+            page = (addr >> 14) & 0xFFFF
+            off = addr & 0x3FFF
+            n = min(len(data) - i, 0x4000 - off, cap)
+            if n & 1:                              # keep chunks word-aligned
+                n -= 1
+            cmd = bytes([0x46, page & 0xFF, (page >> 8) & 0xFF,
+                         off & 0xFF, (off >> 8) & 0xFF, n & 0xFF, (n >> 8) & 0xFF]) + data[i:i + n]
+            self.ser.reset_input_buffer()
+            self.ser.write(cmd)
+            self.ser.flush()
+            ack = self.read(1, timeout=5.0 + n * 0.003)
+            if ack != b"\x4b":                     # 'K'
+                if progress:
+                    sys.stdout.write("\n"); sys.stdout.flush()
+                log(f"  program @0x{addr:05X} x{n}: NO ACK (got {ack.hex() or '<nothing>'})")
+                return False
+            addr += n
+            i += n
+            if progress:
+                progress(i, total)
+        if progress:
+            sys.stdout.write("\n"); sys.stdout.flush()
+        return True
+
+    @staticmethod
+    def list_ports():
+        return [p.device for p in _list_ports.comports()] if serial else []
+
+
+# ── HELLO stub — proves loaded code runs ────────────────────────────────────
+# @0xFA40: send 0xA5 once on ASC0, then spin.  Uses SFR SHORT addressing so it
+# does NOT depend on the BSL's DPP3 value.
+#   E6 58 A5 00   mov  S0TBUF, #0x00A5   ; short addr 0x58 = S0TBUF (0xFEB0)
+#   0D FF         jmpr cc_UC, $          ; spin (the 0xA5 is sent before the spin)
+HELLO_STUB = bytes.fromhex("E658A500" "0DFF")
+
+def _bsl_frame(base: bytes) -> bytes:
+    """Zero-pad a stub to the 32-byte BSL payload the ECU loads at 0xFA40."""
+    return bytes(base).ljust(32, b"\x00")
+
+
+def _send_load(bsl, frame):
+    """Send the 32-byte BSL load over the full-duplex tap."""
+    bsl.ser.reset_input_buffer()
+    bsl.ser.write(frame)
+    bsl.ser.flush()
+
+
+# ── PRELOADER + MONITOR (the BSL loads PRELOADER at 0xFA40) ──────────────────
+# PRELOADER receives exactly MONITOR_LOAD_LEN bytes over ASC0 into IRAM 0xFA60..
+# then jumps to 0xFA60.
+PRELOADER = bytes.fromhex("E6F060FA9AB7FE70A400B2FE7EB786F05FFC3DF8EA0060FA")
+MONITOR_LOAD_LEN = 512
+# MONITOR (loaded at 0xFA60): ASC0 command loop, DPP0 paging.
+#   'P'                                   -> reply 0xA5  (ping)
+#   'R' pgLo pgHi offLo offHi lenLo lenHi -> set DPP0=page; reply <len> bytes from [off]
+#   'W' ... <len data>                    -> set DPP0=page; store at [off]; reply 'K'
+#   'C' offLo offHi                       -> calli a RAM routine (must 'ret'); reply 'D' (0x44)
+#   page=addr>>14, off=addr&0x3FFF; host chunks so off+len<=0x4000.
+MONITOR = bytes.fromhex(
+    "9AB7FE70F3F0B2FE7EB747F050002D0B47F052002D0F47F057002D3847F0"
+    "43002D67EA0060FAE658A5009AB6FE707EB6EA0060FA9AB7FE70F3F4B2FE"
+    "7EB79AB7FE70F3F5B2FE7EB79AB7FE70F3F8B2FE7EB79AB7FE70F3F9B2FE"
+    "7EB79AB7FE70F3FCB2FE7EB79AB7FE70F3FDB2FE7EB7F6F200FE4860EA20"
+    "60FAA9E47EB6F6F7B0FE9AB6FE70084128610DF49AB7FE70F3F4B2FE7EB7"
+    "9AB7FE70F3F5B2FE7EB79AB7FE70F3F8B2FE7EB79AB7FE70F3F9B2FE7EB7"
+    "9AB7FE70F3FCB2FE7EB79AB7FE70F3FDB2FE7EB7F6F200FE48602D099AB7"
+    "FE70F3FEB2FE7EB7B9E4084128610DF57EB6E6584B009AB6FE70EA0060FA"
+    "9AB7FE70F3F8B2FE7EB79AB7FE70F3F9B2FE7EB7AB047EB6E65844009AB6"
+    "FE70EA0060FA")
+# MONITOR_FLASH (loaded at 0xFA60 in place of MONITOR): P/R + 28F200 erase/program.
+# Stack-free (no calli/push) so it's safe to fill IRAM.  Intel 28F200 command set:
+#   'P'                                   -> 0xA5 (ping)
+#   'R' pgLo pgHi offLo offHi lenLo lenHi -> set DPP0=page; reply <len> bytes (read-back)
+#   'E' pgLo pgHi offLo offHi             -> 0x20/0xD0 erase block, poll SR.7; reply SR byte
+#   'F' pgLo pgHi offLo offHi lenLo lenHi <data> -> per word 0x40/data/poll SR.7; reply 'K'
+#                                            (len + off must be EVEN)
+# Entry enables the WR# alternate output (bset DP3.13+P3.13) — the BSL leaves WR# high-Z so
+# external writes never strobe the flash WE# (reads work via the dedicated RD# pin); without
+# it, erase/program silently no-op.  E turns VPP on (P2.6) and leaves it on; F streams data
+# with no settle delay (a delay there overruns the 1-byte UART RX).  NEEDS 12V on VPP/RP#.
+MONITOR_FLASH = bytes.fromhex(
+    "DFE3DFE29AB7FE70F3F0B2FE7EB747F05000EA2092FA47F05200EA20A0FA47F0"
+    "4500EA20F8FA47F04600EA207CFBEA0064FAE658A5009AB6FE707EB6EA0064FA"
+    "9AB7FE70F3F4B2FE7EB79AB7FE70F3F5B2FE7EB79AB7FE70F3F8B2FE7EB79AB7"
+    "FE70F3F9B2FE7EB79AB7FE70F3FCB2FE7EB79AB7FE70F3FDB2FE7EB7F6F200FE"
+    "4860EA2064FAA9E47EB6F6F7B0FE9AB6FE70084128610DF49AB7FE70F3F4B2FE"
+    "7EB79AB7FE70F3F5B2FE7EB79AB7FE70F3F8B2FE7EB79AB7FE70F3F9B2FE7EB7"
+    "F6F200FE6FE16FE06FE36FE2E6F32000E6F1FFFF28113DFE28313DFAE6F52000"
+    "B854E6F5D000B854E6F64000E6F1FFFFE6F57000B854A9E4F00767F080003D04"
+    "28113DF628613DF2E6F5FF00B8547EB6F6F7B0FE9AB6FE70EA0064FA9AB7FE70"
+    "F3F4B2FE7EB79AB7FE70F3F5B2FE7EB79AB7FE70F3F8B2FE7EB79AB7FE70F3F9"
+    "B2FE7EB79AB7FE70F3FCB2FE7EB79AB7FE70F3FDB2FE7EB7F6F200FE6FE16FE0"
+    "6FE36FE24860EA2002FC9AB7FE70F3FEB2FE7EB79AB7FE70F3FFB2FE7EB7E6F5"
+    "4000B854B874E6F1FFFFE6F57000B854A90467F080003D0228113DF708422862"
+    "0DE1E6F5FF00B8547EB6E6584B009AB6FE70EA0064FA")
+# READ_ID_ROUTINE (44 B, loaded to IRAM scratch 0xFC80 via the general monitor's 'W', run via
+# 'C'): enable WR# (bset DP3.13/P3.13) / DPP0=0x11 / write 0x90 (Read ID) / read chip words 0,1
+# through the +0x40000 alias / write 0xFF (read-array) / store the two ID words at 0xFCC0.
+# Non-destructive — no VPP, no erase/program.  asm/read_id.asm, Ghidra-built; does NOT touch
+# MONITOR_FLASH (the proven flash monitor stays byte-for-byte unchanged).
+READ_ID_ROUTINE = bytes.fromhex(
+    "DFE3DFE2E6001100E004E6F59000B854A864E024A874E004E6F5FF00B854E6F4C0FCB864E6F4C2FCB874CB00")
+
+
+def _bsl(args):
+    """Build a BSL from the parsed CLI args (incl. the optional FTDI auto-reset)."""
+    return BSL(args.port, args.baud,
+               reset_line=args.reset_line, reset_hold=args.reset_ms / 1000.0,
+               reset_settle=args.reset_settle / 1000.0, reset_invert=args.reset_invert)
+
+
+def _monitor(args):
+    """Build a BSL and bring up the general RAM monitor (P/R/W/C); None on failure."""
+    bsl = _bsl(args)
+    if not bsl.start_monitor():
+        print("RESULT: monitor did not come up (no 0xA5 ping). Check the load timing / wiring.")
+        return None
+    return bsl
+
+
+def cmd_sync(args):
+    """Confirm BSL entry (0x55) AND that loaded code runs (HELLO stub -> 0xA5)."""
+    bsl = _bsl(args)
+    if not bsl.sync():
+        print("RESULT: no response — BSL did not enter (check ALE/NMI#/RSTIN# and the tap).")
+        return 1
+    print("BSL entered (0x55); loading the HELLO stub to confirm loaded code runs…")
+    _send_load(bsl, _bsl_frame(HELLO_STUB))
+    data = bsl.read(128, timeout=2.0)
+    print(f"  raw          : {data.hex(' ') or '<nothing>'}")
+    seen = 0xA5 in data
+    print("RESULT:", "BSL OK + loaded code RUNS (0xA5 seen)" if seen else
+          "BSL entered but the stub did NOT run (no 0xA5) — check the full-duplex tap")
+    return 0 if seen else 1
+
+
+def cmd_read(args):
+    bsl = _monitor(args)
+    if not bsl:
+        return 1
+    addr_s, _, len_s = args.addr_len.partition(":")
+    addr, length = int(addr_s, 0), int(len_s, 0)
+    data = bsl.mon_read(addr, length)
+    print(f"  read 0x{addr:X} x{length}: {data.hex(' ') or '<nothing>'}")
+    ok = len(data) == length
+    print("RESULT:", "READ OK" if ok else f"SHORT READ ({len(data)}/{length})")
+    return 0 if ok else 1
+
+
+def cmd_write(args):
+    bsl = _monitor(args)
+    if not bsl:
+        return 1
+    addr_s, _, hex_s = args.addr_hex.partition(":")
+    addr = int(addr_s, 0)
+    payload = bytes.fromhex(hex_s.replace(" ", ""))
+    if not bsl.mon_write(addr, payload):
+        print("RESULT: write not ACKed"); return 1
+    back = bsl.mon_read(addr, len(payload))
+    print(f"  wrote {len(payload)} B to 0x{addr:X}; read-back {back.hex(' ') or '<nothing>'} "
+          f"(expected {payload.hex(' ')})")
+    match = (back == payload)
+    print("RESULT:", "WRITE VERIFIED (read-back matches)" if match else "WRITE MISMATCH")
+    return 0 if match else 1
+
+
+def cmd_dump(args):
+    bsl = _monitor(args)
+    if not bsl:
+        return 1
+    start, end = 0x0, 0x40000           # whole chip by default
+    if args.range:
+        s, _, e = args.range.partition(":")
+        start, end = int(s, 0), int(e, 0)
+    # auto shadow-bypass: if the dump touches 0x0-0x7FFF and it's shadowed but the +0x40000
+    # wrap-around reads real flash, route the low range through the alias.
+    alias_low = False
+    if start < BSL_SHADOW_HI and not args.no_alias:
+        direct = bsl.mon_read(0x0, 4)
+        if direct == BSL_BOOTROM_SIG:
+            alias = bsl.mon_read(BSL_ALIAS, 4)
+            if alias != BSL_BOOTROM_SIG and any(b != 0xFF for b in alias):
+                alias_low = True
+                print(f"  0x0-0x7FFF is BSL-shadowed but the +0x{BSL_ALIAS:X} alias reads real "
+                      f"flash — routing the low range through the wrap-around.")
+            else:
+                print("  0x0-0x7FFF shadowed and the alias didn't read flash — the low range "
+                      "will be the raw shadow.")
+    print(f"dumping physical 0x{start:X}..0x{end:X} ({end - start} bytes) — "
+          f"~{(end - start) * 10 / args.baud:.0f}s at {args.baud} baud…")
+    if not args.raw_hole and start < BSL_HOLE[1] and end > BSL_HOLE[0]:
+        print(f"  0xFF-filling the unmapped hole 0x{BSL_HOLE[0]:05X}-0x{BSL_HOLE[1] - 1:05X} "
+              f"(--raw-hole keeps the raw float).")
+    data = bsl.mon_dump(start, end, alias_low=alias_low, fill_hole=not args.raw_hole)
+    full = bytearray(b"\xff" * end)                 # physical/CPU-indexed image
+    full[start:end] = data
+    order = "physical/CPU"
+    if args.file_order:
+        if end % 0x8000:
+            print(f"  NOTE: --file-order needs a 0x8000-aligned end (0x{end:X} isn't); the "
+                  f"trailing odd 16KB block can't be paired.")
+        full = bytearray(_swap_block_order(full))   # -> file / chip-physical order
+        order = "file/chip-physical (bench-flashable)"
+    with open(args.file, "wb") as f:
+        f.write(full)
+    print(f"RESULT: wrote {len(full)} bytes to {args.file} in {order} order"
+          + (", 0x0-0x7FFF via alias" if alias_low else "") + ".")
+    return 0
+
+
+def cmd_verify_alias(args):
+    bsl = _monitor(args)
+    if not bsl:
+        return 1
+    # Self-contained proof the +0x40000 wrap-around reads the REAL flash (no reference file):
+    # the directly-readable flash (>=0x8000) must read IDENTICALLY through its high alias.
+    print("ALIAS SELF-CHECK — does the +0x%05X wrap-around reach real flash?" % BSL_ALIAS)
+    d0, a0 = bsl.mon_read(0x0, 16), bsl.mon_read(BSL_ALIAS, 16)
+    print(f"  phys 0x00000 direct : {d0.hex(' ') or '<nothing>'}")
+    print(f"  phys 0x{BSL_ALIAS:05X} alias  : {a0.hex(' ') or '<nothing>'}")
+    shadowed = d0[:4] == BSL_BOOTROM_SIG
+    alias_flash = a0[:4] != BSL_BOOTROM_SIG and any(b != 0xFF for b in a0)
+    print(f"  0x0 is {'the BSL boot-ROM shadow' if shadowed else 'directly readable'}; "
+          f"alias reads {'REAL FLASH' if alias_flash else 'NOT flash (boot-ROM/empty)'}")
+    print("  wrap cross-check (directly-readable flash vs its +alias — must MATCH):")
+    allmatch = True
+    for p in (0x08000, 0x10000, 0x18000, 0x20000, 0x30000, 0x3FFF0):
+        dd, aa = bsl.mon_read(p, 16), bsl.mon_read(p + BSL_ALIAS, 16)
+        ok = dd == aa and len(dd) == 16
+        allmatch = allmatch and ok
+        print(f"    0x{p:05X} vs 0x{p + BSL_ALIAS:05X}: {'MATCH' if ok else 'DIFF '}  {dd.hex(' ')}")
+    good = alias_flash and allmatch
+    print(f"RESULT: alias read path {'CONFIRMED RELIABLE' if good else 'NOT confirmed'} "
+          f"(reaches-flash={alias_flash}, wrap-consistent={allmatch}). "
+          + ("Safe to read/flash 0x0-0x7FFF via the alias." if good else
+             "Do NOT trust alias writes until this passes."))
+    return 0 if good else 1
+
+
+def cmd_vpp_on(args):
+    bsl = _monitor(args)
+    if not bsl:
+        return 1
+    ok = bsl.set_vpp(True, [(2, 6)])                # VPP gate = P2.6 (HW-confirmed)
+    print("RESULT: VPP rail switched ON via P2.6"
+          + ("" if ok else " (a port op failed — check the monitor)") +
+          ".\n  Measure ~12V at the 28F200 VPP pin now. Any other command resets the pin.")
+    return 0 if ok else 1
+
+
+def cmd_businfo(args):
+    bsl = _monitor(args)
+    if not bsl:
+        return 1
+    for name, a in (("SYSCON", 0xFF12), ("BUSCON0", 0xFF0C), ("BUSCON1", 0xFF14),
+                    ("ADDRSEL1", 0xFE18), ("BUSCON2", 0xFF16), ("ADDRSEL2", 0xFE1A)):
+        v = bsl.mon_read(a, 2)
+        val = f"0x{int.from_bytes(v, 'little'):04X}" if len(v) == 2 else "<short>"
+        print(f"  {name:8} @0x{a:04X} = {val}   raw {v.hex(' ') or '--'}")
+    print("RESULT: bus config read")
+    return 0
+
+
+# Known 28F200 IDs (manufacturer 0x0089 = Intel).  The MS41 uses the bottom-boot -B.
+_FLASH_IDS = {
+    (0x0089, 0x2274): "Intel 28F200BX-T  (2 Mbit, top-boot)",
+    (0x0089, 0x2275): "Intel 28F200BX-B  (2 Mbit, bottom-boot)",
+}
+
+
+def cmd_id(args):
+    bsl = _monitor(args)
+    if not bsl:
+        return 1
+    mfr, dev = bsl.mon_read_id()
+    if mfr is None:
+        print("RESULT: could not read the flash ID (the routine failed to load/run)."); return 1
+    print(f"  manufacturer : 0x{mfr:04X}{'  (Intel)' if mfr == 0x0089 else ''}")
+    print(f"  device       : 0x{dev:04X}")
+    name = _FLASH_IDS.get((mfr, dev))
+    if name:
+        print(f"RESULT: {name} — confirmed.")
+        return 0
+    print("RESULT: ID read back, but (0x%04X, 0x%04X) isn't in the known table. If those look "
+          "like flash contents rather than 0x0089/0x22xx, the Read-ID command didn't latch "
+          "(WR#/alias) even though the read path worked." % (mfr, dev))
+    return 0
+
+
+# ── 28F200 flasher ──────────────────────────────────────────────────────────
+# 28F200 erase-BLOCK map in CPU addresses.  A GAL on the board inverts CPU A14 to drive
+# flash A13 (Flash A13 = !CPU A14), so chip_addr = cpu_addr XOR 0x4000 — every 16KB block
+# is swapped with its neighbour.  The monitor drives CPU addresses and the chip latches the
+# erase block from the CHIP address, so the CPU ranges below are the datasheet's chip blocks
+# XOR 0x4000 (hence the chip's HW-locked boot block sits at CPU 0x4000-0x7FFF, while the CPU
+# reset vectors `fa 00 30 04` live in a param block).  Erase is block-granular; each `span`
+# is one full block, programmed back from the reference.
+#
+#   CPU range        chip block (XOR 0x4000)  size  region
+#   0x00000-0x01FFF  param1 (chip 0x4000)      8K   boot (reset/trap vectors)
+#   0x02000-0x03FFF  param2 (chip 0x6000)      8K   program-low
+#   0x04000-0x07FFF  BOOT A (chip 0x0000)     16K   program-mid  **HW-locked, RP#=12V**
+#   0x08000-0x1FFFF  main D (chip 0x8000)     96K   tune (cal); CPU 0xC000-0xFFFF unmapped (hole)
+#   0x20000-0x3FFFF  main E (chip 0x20000)   128K   program-high
+#
+# `low=True` = block in the BSL-shadowed CPU 0x0-0x7FFF; cmd_flash routes its ops through the
+# +0x40000 wrap-around alias.  `rp12=True` = the chip's HW-locked boot block (needs RP#=12V,
+# which shares the VPP net here).  Reference .bin is file/chip order; CPU<->file is XOR 0x4000.
+BSL_BOOTROM_SIG = bytes.fromhex("fa000001")   # phys 0x0 in BSL mode if 0x0-0x7FFF is shadowed
+BSL_SHADOW_HI   = 0x8000                       # the bootstrap-ROM overlay covers phys 0x0-0x7FFF
+# SHADOW BYPASS: the 80C166W external bus is ~256KB and WRAPS, so physical addr+0x40000 presents
+# addr&0x3FFFF on the wire but lands OUTSIDE the 0x0-0x7FFF overlay slot — so the CPU runs a real
+# external cycle and the flash drives the REAL low data (reading 0x40000 returns the flash boot
+# vectors, not the boot-ROM).  The low blocks are read/erased/programmed/verified through +0x40000.
+BSL_ALIAS = 0x40000
+# UNMAPPED HOLE (CPU 0xC000-0xFFFF): no chip drives the bus here, so a raw read returns a floating
+# address-ramp; the true content is 0xFF (matches stock dumps).  Dumps 0xFF-fill it (--raw-hole
+# keeps the raw float) and the flasher never writes/verifies it (the tune region `hole`).
+BSL_HOLE = (0x0C000, 0x10000)
+FLASH_REGIONS = {
+    "boot":         dict(erase=0x00000, span=(0x00000, 0x02000), low=True),             # ->param1 8K: vectors
+    "program-low":  dict(erase=0x02000, span=(0x02000, 0x04000), low=True),             # ->param2 8K
+    "program-mid":  dict(erase=0x04000, span=(0x04000, 0x08000), low=True, rp12=True),  # ->BOOT blk A 16K (HW-lock)
+    "tune":         dict(erase=0x10000, span=(0x08000, 0x20000), hole=BSL_HOLE),  # ->main D 96K cal/tune; CPU 0xC000-0xFFFF unmapped (BSL_HOLE)
+    "program-high": dict(erase=0x20000, span=(0x20000, 0x40000)),                       # ->main E 128K
+}
+
+
+def _file_to_phys(ref, lo, hi):
+    """Reference bytes for physical [lo,hi).  file_off = phys XOR 0x4000 (the
+    confirmed block-swap; bit-14 flip is constant within a 16KB page)."""
+    out = bytearray()
+    addr = lo
+    while addr < hi:
+        page_end = min((addr & ~0x3FFF) + 0x4000, hi)
+        n = page_end - addr
+        f = addr ^ 0x4000
+        out += ref[f:f + n]
+        addr = page_end
+    return bytes(out)
+
+
+def _swap_block_order(img):
+    """XOR-0x4000 per-16KB-block swap — converts a CPU/physical-order image to
+    file/chip-physical (bench-flashable, DS2 .bin) order, and vice-versa (self-
+    inverse).  Swaps each adjacent pair of 16KB blocks (the GAL inverts CPU A14 ->
+    flash A13).  A trailing odd 16KB block with no partner is left in place."""
+    BLK = 0x4000
+    out = bytearray(img)
+    n = len(img)
+    b = 0
+    while b * BLK < n:
+        s, d = b * BLK, (b ^ 1) * BLK     # partner block = this block's index XOR 1
+        if s + BLK <= n and d + BLK <= n:
+            out[s:s + BLK] = img[d:d + BLK]
+        b += 1
+    return bytes(out)
+
+
+def _decode_sr(sr):
+    if sr is None:
+        return "no reply (monitor stuck or erase never returned)"
+    bits = []
+    bits.append("ready" if sr & 0x80 else "BUSY/timed-out")
+    if sr & 0x20: bits.append("ERASE-ERROR(SR.5)")
+    if sr & 0x10: bits.append("PROG-ERROR(SR.4)")
+    if sr & 0x08: bits.append("VPP-LOW(SR.3) — is 12V on the VPP/RP# rail?")
+    return f"0x{sr:02X} [" + ", ".join(bits) + "]"
+
+
+FLASH_ALL_ORDER = ["boot", "program-low", "program-mid", "tune", "program-high"]
+
+
+def _region_plan(args, region, ref):
+    """Geometry + reference bytes (physical order) for one region.  Returns a dict;
+    raises ValueError(msg) if `ref` is the wrong kind/size for this region."""
+    spec = FLASH_REGIONS[region]
+    erase_addr, (lo, hi) = spec["erase"], spec["span"]
+    low, rp12 = spec.get("low", False), spec.get("rp12", False)
+    hole = spec.get("hole")                        # (h_lo,h_hi) CPU range: unmapped, never touch
+    in_hole = (lambda a: bool(hole) and hole[0] <= a < hole[1])
+
+    is_partial = (len(ref) == CAL_PARTIAL_SIZE)    # 24KB cal/tune partial
+    if is_partial:
+        if region != "tune":
+            raise ValueError(f"a 24KB cal partial only covers 'tune' (CPU 0x10000-0x15FFF); "
+                             f"region '{region}' needs a full file-order image.")
+        # partial[i] -> CPU 0x10000+i  (ds2.PARTIAL_DS2_ADDR=0x10000, no block-swap; DS2 addr ==
+        # the CPU/firmware address the BSL monitor uses, so it drops straight into the tune block)
+        refdata = bytearray(b"\xff" * (hi - lo))
+        base = 0x10000 - lo                        # span index of CPU 0x10000
+        refdata[base:base + len(ref)] = ref
+        refdata = bytes(refdata)
+    else:
+        if len(ref) < hi:                          # file_off = phys^0x4000 stays in [lo,hi)
+            raise ValueError(f"reference is {len(ref)} B; need >= 0x{hi:X} (a full file-order "
+                             f"image)" + (" or a 24KB cal partial" if region == "tune" else ""))
+        refdata = _file_to_phys(ref, lo, hi)
+
+    # program only the non-0xFF window: erase leaves the block 0xFF and the 28F200 can't drive a
+    # 1->0 that isn't there, so 0xFF ref bytes are no-ops.  Hole bytes are never real flash.
+    nz = [i for i, b in enumerate(refdata) if b != 0xFF and not in_hole(lo + i)]
+    w_lo, w_hi = (nz[0] & ~1, (nz[-1] + 2) & ~1) if nz else (0, 0)    # word-align the window out
+    prog_chunks = []                               # program chunks that skip the hole
+    if w_hi > w_lo:
+        if hole and lo + w_lo < hole[1] and hole[0] < lo + w_hi:
+            h0, h1 = hole[0] - lo, hole[1] - lo
+            if w_lo < h0: prog_chunks.append((w_lo, h0))
+            if h1 < w_hi: prog_chunks.append((h1, w_hi))
+        else:
+            prog_chunks.append((w_lo, w_hi))
+    return dict(erase_addr=erase_addr, lo=lo, hi=hi, low=low, rp12=rp12, hole=hole,
+                in_hole=in_hole, refdata=refdata, w_lo=w_lo, w_hi=w_hi,
+                prog_chunks=prog_chunks, is_partial=is_partial)
+
+
+def _print_plan(args, region, p, ref):
+    lo, hi, w_lo, w_hi = p["lo"], p["hi"], p["w_lo"], p["w_hi"]
+    refdata, hole = p["refdata"], p["hole"]
+    kind = "24KB cal partial" if p["is_partial"] else "file-order"
+    print(f"== FLASH PLAN: region '{region}' ==")
+    print(f"  reference     : {args.ref} ({len(ref)} B, {kind})")
+    print(f"  erase block   : 0x{p['erase_addr']:05X}  -> erases the whole 0x{lo:05X}..0x{hi:05X} "
+          f"block ({hi - lo} B, granular)")
+    print(f"  program window: 0x{lo + w_lo:05X}..0x{lo + w_hi:05X}  ({w_hi - w_lo} B of real data; "
+          f"rest of block stays 0xFF)")
+    if hole:
+        print(f"  unmapped hole : 0x{hole[0]:05X}..0x{hole[1]:05X} — floating bus, NOT real flash; "
+              f"never written or verified (erase still clears the whole block).")
+    if p["is_partial"]:
+        print(f"  cal mapping   : partial -> CPU 0x10000..0x{0x10000 + len(ref):05X} "
+              f"(DS2/CPU order; rest of the tune block left 0xFF)")
+    else:
+        print(f"  verify span   : 0x{lo:05X}..0x{hi:05X}  (file 0x{lo ^ 0x4000:05X}.. via XOR 0x4000)")
+    if w_hi > w_lo:
+        print(f"  ref @0x{lo + w_lo:05X}   : {refdata[w_lo:w_lo + 16].hex(' ')} …")
+    print(f"  ref checksum  : {sum(refdata) & 0xFFFFFFFF:08X} over {len(refdata)} B")
+    if p["rp12"]:
+        print( "  ** RP#=12V    : 28F200 HW-LOCKED boot block — RP# must be 11.4-12.6V for the "
+               "erase/program. On this ECU RP# shares the VPP net, so the VPP 12V covers it.")
+    if p["low"]:
+        print( "  ** BSL SHADOW : 0x0-0x7FFF is overlaid by the BSL bootstrap-ROM; the run "
+               "pre-flights phys 0x0 and, if shadowed, routes ALL ops for this region")
+        print(f"                  through the +0x{BSL_ALIAS:X} wrap-around alias (reaches the "
+               "real flash).")
+    print( "  REQUIRES      : 12V on the 28F200 VPP pin (else erase/program no-op; SR.3 flags it)")
+
+
+def _variant_guard(bsl, args, ref):
+    """Compare the reference's MS41 variant to the ECU's current cal (CPU 0x10000) and refuse a
+    mismatch (or an internally cross-variant ROM) unless --force.  A blank/virgin ECU has no
+    variant to compare against, so it is allowed (that's the whole point of recovery).  0=ok."""
+    if MS41ECU is None:
+        print("  variant guard : ms41_variant.py not importable — SKIPPED."); return 0
+    ref_var, ref_id = MS41ECU.detect_variant(ref), MS41ECU.read_calid(ref)
+    # the reference's own internal consistency (independent of what's on the ECU)
+    if len(ref) >= MS41ECU.FULL_ROM_SIZE:
+        hybrid = MS41ECU.check_hybrid(ref)
+        if hybrid:
+            print(f"  ** HYBRID ROM  : {hybrid}")
+            if not args.force:
+                print("RESULT: reference is internally cross-variant (would brick) — refusing. "
+                      "Use --force only if you are certain."); return 1
+    ecu_cal = bsl.mon_read(0x10000, 0x33C0)        # covers cal-ID (0x000E) + SS1 marker (0x033BB)
+    ecu_blank = bool(ecu_cal) and all(b == 0xFF for b in ecu_cal)
+    ecu_var, ecu_id = MS41ECU.detect_variant(ecu_cal), MS41ECU.read_calid(ecu_cal)
+    print(f"  variant guard : reference = {ref_var or '?'} (CAL ID {ref_id or '?'})  vs  "
+          f"ECU = {('BLANK' if ecu_blank else ecu_var or '?')} (CAL ID {ecu_id or '?'})")
+    if ecu_blank:
+        print("  (ECU cal reads blank 0xFF — virgin/erased chip; nothing to compare, proceeding.)")
+        return 0
+    if ref_var and ecu_var and ref_var != ecu_var:
+        print(f"  ** MISMATCH    : writing a {ref_var} image onto a {ecu_var} ECU can BRICK it.")
+        if not args.force:
+            print("RESULT: variant mismatch — refusing. Re-run with --force if you are certain.")
+            return 1
+        print("  --force        : proceeding despite the variant mismatch.")
+    elif not ref_var or not ecu_var:
+        print("  (variant undetermined on one side — no guard applied; proceeding.)")
+    return 0
+
+
+def _checksum_guard(args, ref, regions):
+    """Verify (and with --fix-checksums, correct) the reference's MS41 checksums — file-only, no
+    hardware.  Prints status; returns (ref_maybe_fixed, hard_block).  A bad checksum whose ECU
+    verification is DISABLED only warns (e.g. the MS41.3 program checksum)."""
+    if cks is None:
+        print("  checksums     : ms41_checksum.py not importable — SKIPPED."); return ref, False
+    if len(ref) not in (cks.FULL_ROM_SIZE, cks.TUNE_SIZE):
+        print(f"  checksums     : ref is {len(ref)} B (not a full ROM or 24KB partial) — SKIPPED.")
+        return ref, False
+
+    if args.fix_checksums:
+        var = MS41ECU.detect_variant(ref) if MS41ECU else None
+        corr_prog = (var != "MS41.3")              # MS41.3 program-checksum layout unconfirmed (+ disabled)
+        fixed, notes = cks.correct_checksums(bytearray(ref), correct_program=corr_prog)
+        ref = bytes(fixed)
+        for n in notes:
+            print(f"  fix-checksums : {n}")
+
+    ok, details = cks.verify_checksum(bytearray(ref))
+    for d in details:
+        print(f"  checksum      : {d}")
+    if ok:
+        return ref, False
+
+    st = cks.checksum_status(ref)
+    involves_cal = "tune" in regions
+    involves_prog = bool({"boot", "program-low", "program-mid", "program-high"} & set(regions))
+    hard = False
+    if involves_cal and st["cal"] is False:
+        if st["cal_disabled"]:
+            print("  note          : cal checksum is bad but the cal CRC check is DISABLED — allowing.")
+        else:
+            print("  ** CAL CHECKSUM invalid and the cal CRC check is ENABLED — the ECU would reject it.")
+            hard = True
+    if involves_prog and st["program"] is False:
+        if st["prog_disabled"]:
+            print("  note          : program checksum is bad but program verification is DISABLED "
+                  "(0x605C) — allowing (this is normal on MS41.3).")
+        else:
+            print("  ** PROGRAM CHECKSUM invalid and verification is ENABLED (0x605C) — would brick.")
+            hard = True
+    if involves_prog and st["boot"] is False:
+        print("  note          : boot-sector checksum mismatch (rarely enforced).")
+    if hard:
+        print("  -> re-run with --fix-checksums to correct it, or --force to flash anyway.")
+    return ref, hard
+
+
+def _flash_region(bsl, args, region, p):
+    """Erase + program + verify one region using an already-started monitor.  0=ok, 1=fail."""
+    lo, hi, refdata, hole = p["lo"], p["hi"], p["refdata"], p["hole"]
+    in_hole, rp12, erase_addr = p["in_hole"], p["rp12"], p["erase_addr"]
+    print(f"\n-- '{region}'  (0x{lo:05X}..0x{hi:05X}) --")
+
+    # shadow pre-flight for the low blocks -> route ALL ops through the +BSL_ALIAS wrap-around
+    acc = 0
+    if p["low"]:
+        head = bsl.mon_read(0x0, 16)
+        print(f"  phys 0x0 read : {head.hex(' ') or '<nothing>'}")
+        if head[:4] == BSL_BOOTROM_SIG:
+            ahead = bsl.mon_read(BSL_ALIAS, 16)
+            print(f"  alias 0x{BSL_ALIAS:05X}: {ahead.hex(' ') or '<nothing>'}")
+            if ahead[:4] == BSL_BOOTROM_SIG or all(b == 0xFF for b in ahead):
+                print("RESULT: 0x0-0x7FFF shadowed AND the +0x40000 alias did not read flash -> "
+                      "region unreachable here. Nothing erased."); return 1
+            acc = BSL_ALIAS
+            print(f"  shadow bypass : routing all ops through +0x{BSL_ALIAS:X}.")
+        else:
+            print("  (no boot-ROM signature — shadow absent; addressing directly)")
+
+    if not args.no_backup:
+        before = bsl.mon_read(lo + acc, hi - lo, progress=_make_bar("backup"))
+        bpath = f"flash_backup_{region}_0x{lo:05X}.bin"
+        with open(bpath, "wb") as f:
+            f.write(before)
+        print(f"  backup        : saved {len(before)} B of current 0x{lo:05X}.. to {bpath}")
+
+    print(f"  erasing 0x{erase_addr:05X} (whole {hi - lo} B block)" +
+          (f" via alias 0x{erase_addr + acc:05X}" if acc else "") + "…")
+    sr = bsl.mon_erase(erase_addr + acc)
+    print(f"  erase status  : {_decode_sr(sr)}")
+    if sr is None or not (sr & 0x80) or (sr & 0x28):
+        print("RESULT: erase did NOT complete cleanly — aborting before any program. Check the "
+              "12V VPP supply" + (" (RP# shares it for the boot block)" if rp12 else "") + ".")
+        return 1
+
+    chk = bsl.mon_read(lo + acc, hi - lo, progress=_make_bar("post-erase"))  # erase reached flash?
+    bad = next((lo + i for i, b in enumerate(chk) if b != 0xFF and not in_hole(lo + i)), None)
+    if bad is not None:
+        print(f"  post-erase    : NOT all-0xFF (first @0x{bad:05X}=0x{chk[bad - lo]:02X}) — erase "
+              f"didn't clear the block. No program attempted."); return 1
+    print("  post-erase    : real-flash region reads 0xFF (OK)" +
+          (f"; hole 0x{hole[0]:05X}-0x{hole[1]:05X} ignored" if hole else ""))
+
+    if p["prog_chunks"]:
+        for c_lo, c_hi in p["prog_chunks"]:
+            n = c_hi - c_lo
+            print(f"  programming   : {n} B @0x{lo + c_lo:05X} from reference "
+                  f"(~{n * 10 / args.baud:.0f}s at {args.baud})…")
+            if not bsl.mon_program(lo + acc + c_lo, refdata[c_lo:c_hi],
+                                   progress=_make_bar("program")):
+                print("RESULT: program not ACKed — STOPPED. Region partially written; re-arm to "
+                      "retry (it re-erases first)."); return 1
+    else:
+        print("  programming   : reference is all-0xFF here — nothing to write (block erased).")
+
+    back = bsl.mon_read(lo + acc, hi - lo, progress=_make_bar("verify"))  # read-back verify
+    diffs = [i for i, (a, b) in enumerate(zip(back, refdata)) if a != b and not in_hole(lo + i)]
+    ok = (not diffs and len(back) == hi - lo)
+    print(f"  verify span   : {'MATCH' if ok else f'{len(diffs)} byte(s) differ'} "
+          f"(read {len(back)}/{hi - lo} B" + (", hole skipped" if hole else "") + ")")
+    if ok:
+        print(f"  RESULT        : '{region}' FLASHED + VERIFIED (read-back == reference)."); return 0
+    if diffs:
+        i = diffs[0]
+        print(f"  first diff @0x{lo + i:05X}: flash {back[i]:02X} vs ref {refdata[i]:02X}")
+    print("RESULT: VERIFY MISMATCH. If read-back is all-0xFF the writes didn't reach the flash "
+          "(no VPP); else the reference differs from what was programmed.")
+    return 1
+
+
+def cmd_flash(args):
+    if not args.ref:
+        print("need --ref <reference .bin> (full file-order image, or a 24KB cal for 'tune')")
+        return 2
+    try:
+        ref = open(args.ref, "rb").read()
+    except OSError as e:
+        print(f"cannot open --ref: {e}"); return 2
+
+    if args.region == "all":
+        regions = list(FLASH_ALL_ORDER)
+        need = FLASH_REGIONS["program-high"]["span"][1]
+        if len(ref) < need:
+            print(f"'all' needs a full file-order image (>= 0x{need:X} B); got {len(ref)} B.")
+            return 2
+    else:
+        regions = [args.region]
+
+    print("== CHECKSUMS ==")
+    ref, ck_block = _checksum_guard(args, ref, regions)
+
+    try:
+        plans = {r: _region_plan(args, r, ref) for r in regions}
+    except ValueError as e:
+        print(str(e)); return 2
+
+    for r in regions:
+        _print_plan(args, r, plans[r], ref)
+    involves_cal = "tune" in regions
+    note = "" if (MS41ECU or not involves_cal) else "; ms41_variant.py missing -> SKIPPED"
+    print(f"\n  variant guard : {'ON (checked against the ECU when armed)' if involves_cal else 'n/a (no cal here)'}{note}")
+    if ck_block:
+        print("  checksum block: an ENABLED checksum is invalid — --arm will refuse without "
+              "--fix-checksums or --force.")
+    if not args.arm:
+        print("\nDRY RUN — nothing was sent. Re-run with --arm to execute.")
+        return 0
+
+    if ck_block and not args.force:
+        print("\nRESULT: checksum issue (see CHECKSUMS above) — refusing to flash. Re-run with "
+              "--fix-checksums to correct it, or --force to flash anyway."); return 1
+
+    print("\n--arm given: executing.")
+    bsl = _bsl(args)
+    if not bsl.start_monitor(flash=True):
+        print("RESULT: flash monitor did not come up (no 0xA5). Check wiring/timing."); return 1
+    # The monitor enables WR# (P3.13) at entry and VPP (P2.6/P3.6) at the first erase, then leaves
+    # both ON for the rest of the session (a reset clears them) — see MONITOR_FLASH.  One monitor
+    # load services every region of an 'all' run.
+    print("  vpp/wr#       : monitor drives WR# (P3.13) from entry and VPP (P2.6) from the first "
+          "erase, held on through programming; a reset clears them.")
+    if involves_cal and _variant_guard(bsl, args, ref):
+        return 1
+
+    for r in regions:
+        rc = _flash_region(bsl, args, r, plans[r])
+        if rc:
+            if len(regions) > 1:
+                print(f"\nRESULT: 'all' STOPPED at '{r}'. Earlier regions are flashed; re-run to "
+                      f"resume (every region re-erases first).")
+            return rc
+    if len(regions) > 1:
+        print(f"\nRESULT: ALL {len(regions)} regions FLASHED + VERIFIED.")
+    return 0
+
+
+def main():
+    for _s in (sys.stdout, sys.stderr):             # never let a non-cp1252 char crash a print
+        try:
+            _s.reconfigure(errors="replace")
+        except Exception:
+            pass
+    ap = argparse.ArgumentParser(description="MS41 80C166 BSL unbrick")
+    ap.add_argument("--version", action="version", version=f"MS41 BSL Unbricker {__version__}")
+    ap.add_argument("--port", required=True, help="serial port, e.g. COM3")
+    ap.add_argument("--baud", type=int, default=9600,
+                    help="BSL baud (host picks it; ECU auto-bauds). default 9600")
+    ap.add_argument("--speed", choices=["slow", "mid", "fast"], default=None,
+                    help="convenience baud presets (override --baud): slow=9600, mid=19200, "
+                         "fast=38400. The ECU's BOOTSTRAP auto-baud (in CPU silicon, before our "
+                         "monitor loads) sets the limit: 9600/19200 lock cleanly; higher rates "
+                         "may not (a garbled sync reply = it couldn't lock — drop a preset). "
+                         "mid (19200) is the proven sweet spot here.")
+    ap.add_argument("--reset-line", choices=["rts", "dtr"], default=None,
+                    help="auto-pulse the CPU reset into BSL before each sync, via this FTDI "
+                         "output. RTS and DTR are the PC->device OUTPUTS; CTS/DSR/DCD are inputs "
+                         "you cannot drive. Wire it to RSTIN# (active-low). Omit to reset by hand.")
+    ap.add_argument("--reset-ms", type=float, default=20.0, metavar="MS",
+                    help="ms to hold the reset asserted (default 20).")
+    ap.add_argument("--reset-settle", type=float, default=15.0, metavar="MS",
+                    help="ms to wait after releasing reset before sync, for the BSL to come up "
+                         "(default 15).")
+    ap.add_argument("--reset-invert", action="store_true",
+                    help="invert reset polarity — use if a transistor/inverter sits between the "
+                         "FTDI pin and RSTIN# (so the line must go HIGH to assert reset).")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("ports", help="list serial ports")
+    sub.add_parser("sync", help="confirm BSL entry (0x55) and that loaded code runs (0xA5)")
+
+    rp = sub.add_parser("read", help="read memory and print hex")
+    rp.add_argument("addr_len", metavar="ADDR:LEN",
+                    help="24-bit address and byte count, e.g. 0x10000:256")
+
+    wp = sub.add_parser("write", help="write hex bytes to scratch RAM and verify (NOT flash — "
+                                      "flash needs erase/program; use the `flash` command)")
+    wp.add_argument("addr_hex", metavar="ADDR:HEX",
+                    help="address and hex bytes, e.g. 0xFC80:DEADBEEF (free IRAM scratch)")
+
+    dp = sub.add_parser("dump", help="dump flash to a .bin file")
+    dp.add_argument("file", help="output .bin path")
+    dp.add_argument("--range", metavar="START:END", default=None,
+                    help="physical range to dump (default the whole chip 0x0:0x40000)")
+    dp.add_argument("--file-order", action="store_true",
+                    help="save in file/chip order (block-swap XOR 0x4000) so the dump is a "
+                         "bench-flashable .bin; default is raw physical/CPU order")
+    dp.add_argument("--no-alias", action="store_true",
+                    help="do NOT route the BSL-shadowed 0x0-0x7FFF through the +0x40000 alias")
+    dp.add_argument("--raw-hole", action="store_true",
+                    help="keep the raw floating-bus read of the unmapped CPU 0xC000-0xFFFF hole "
+                         "(default 0xFF-fills it to match stock dumps)")
+
+    sub.add_parser("verify-alias", help="prove the +0x40000 wrap-around reaches real flash "
+                                        "(run before trusting the alias for writes)")
+    sub.add_parser("vpp-on", help="switch VPP (P2.6) on so you can meter ~12V at the 28F200 "
+                                  "VPP pin; any other command resets it")
+    sub.add_parser("businfo", help="read SYSCON/BUSCON/ADDRSEL to inspect the bus config")
+    sub.add_parser("id", help="read the flash chip's manufacturer + device ID (28F200 Read "
+                              "Identifier; non-destructive, no 12V needed)")
+
+    fp = sub.add_parser("flash", help="28F200 erase+program+verify a region from a reference "
+                                      "(DRY-RUN unless --arm). NEEDS 12V on VPP/RP#.")
+    fp.add_argument("region", choices=list(FLASH_REGIONS) + ["all"],
+                    help="28F200 erase-block (CPU addrs; chip block = XOR 0x4000): "
+                         "'tune' (96K cal, CPU 0x8000) / 'program-high' (128K, 0x20000) are "
+                         "directly BSL-reachable. 'boot' (8K, CPU 0x0 = reset VECTORS; firmware "
+                         "never erases these) / 'program-low' (8K, CPU 0x2000) / 'program-mid' "
+                         "(16K, CPU 0x4000 = chip's HW-LOCKED boot block, needs RP#=12V) live in "
+                         "the BSL-shadowed 0x0-0x7FFF and are auto-routed through the +0x40000 "
+                         "alias. 'all' = flash every block in one monitor session (needs a full "
+                         "image) — for a virgin/dead chip.")
+    fp.add_argument("--ref", metavar="FILE", default=None,
+                    help="reference to program from: a full file-order .bin (e.g. an exact-ECU "
+                         "dump or corrected image) for any region, OR a 24KB cal partial (DS2 "
+                         "tune file) for the 'tune' region only.")
+    fp.add_argument("--arm", action="store_true",
+                    help="actually ERASE + PROGRAM + VERIFY the chip. WITHOUT --arm this is a "
+                         "DRY RUN: it only prints the plan (which block erases, the program "
+                         "window, the variant check) and never opens the port or touches the "
+                         "ECU — safe to review first. Add --arm only when the plan looks right.")
+    fp.add_argument("--no-backup", action="store_true",
+                    help="skip saving the current span to a .bin before erasing")
+    fp.add_argument("--fix-checksums", action="store_true",
+                    help="recompute and correct the reference's MS41 checksums (boot + cal, plus "
+                         "program for non-MS41.3) in memory before flashing, instead of refusing a "
+                         "bad-checksum image. Only the stored checksum bytes change.")
+    fp.add_argument("--force", action="store_true",
+                    help="override the guards (flash even on a cross-variant image OR a bad, "
+                         "ENABLED checksum). Use only when you are certain — either can brick the ECU.")
+    args = ap.parse_args()
+    if args.speed:                                  # preset overrides --baud
+        args.baud = {"slow": 9600, "mid": 19200, "fast": 38400}[args.speed]
+
+    if args.cmd == "ports":
+        print("\n".join(BSL.list_ports()) or "(none)"); return 0
+    try:
+        return {
+            "sync": cmd_sync, "read": cmd_read, "write": cmd_write, "dump": cmd_dump,
+            "verify-alias": cmd_verify_alias, "vpp-on": cmd_vpp_on, "businfo": cmd_businfo,
+            "id": cmd_id,
+            "flash": cmd_flash,
+        }[args.cmd](args)
+    except _SERIAL_ERRS as e:
+        print(f"\nSERIAL ERROR ({e.__class__.__name__}): {e}")
+        print("This is the USB-to-serial adapter, not the ECU. An FT232 left idle gets put to "
+              "sleep by Windows USB selective-suspend (or wedges after a long idle), so the "
+              "next access stalls. Fixes, easiest first:")
+        print("  1. Unplug/replug the FT232 and re-run (the tool also auto-reopens on sync).")
+        print("  2. Disable USB selective-suspend: Device Manager > the COM port (and the USB "
+              "Root Hub) > Power Management > uncheck 'Allow the computer to turn off this "
+              "device'; and Power Options > USB settings > USB selective suspend > Disabled.")
+        print("  Re-running is safe: a stall during sync/load flashed nothing; a stall "
+              "mid-program leaves that region partial, and every region re-erases first.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

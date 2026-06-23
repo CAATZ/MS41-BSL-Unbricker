@@ -1,0 +1,23 @@
+# ── Byte-compiled / caches / virtualenvs ───────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# ── ECU flash images & backups — PRIVACY / RESEARCH-ONLY ────────────────
+# Full ROM dumps contain the VIN (file offset 0x5D07) and the ECU/CAL IDs.
+# Never commit flash images, dumps, or backups to this repo.
+*.bin
+flash_backup_*.bin
+
+# ── Logs & runtime output ───────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS / editor cruft ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,2 @@
+# MS41 BSL Unbricker — runtime dependency.
+pyserial>=3.5
