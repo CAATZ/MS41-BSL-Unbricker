@@ -149,6 +149,8 @@ This tool stands on public hardware documentation and prior community work:
   SLEIGH processor module for **[Ghidra](https://github.com/NationalSecurityAgency/ghidra)**,
   used to disassemble and assemble the RAM monitor and the 0xFA40 stubs.
 
+Thanks also to **[grantUser](https://github.com/grantUser)** for collaborative ideation.
+
 ---
 
 ## License
