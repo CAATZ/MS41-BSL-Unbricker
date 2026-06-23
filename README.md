@@ -61,10 +61,28 @@ Note: A FTDI232 adapter is recommended.
 
 ## Install
 
+Pick one — all three take the **same arguments**:
+
+**1. Standalone Windows executable** (no Python needed). Download `bsl_unbrick.exe` from the
+[latest release](https://github.com/CAATZ/MS41-BSL-Unbricker/releases) and run it from a terminal:
+```bash
+bsl_unbrick.exe --port COM4 --reset-line dtr id
+```
+First run may trip Windows SmartScreen / antivirus — a known PyInstaller false positive; click
+*More info → Run anyway*.
+
+**2. pip** (any OS, Python 3.8+). Install the wheel from the release; it pulls in pyserial and
+adds an `ms41-bsl-unbrick` command:
+```bash
+pip install ms41_bsl_unbrick-1.0.0-py3-none-any.whl
+ms41-bsl-unbrick --port COM4 --reset-line dtr id
+```
+
+**3. From source** (Python 3.8+):
 ```bash
 pip install -r requirements.txt      # just pyserial
+python bsl_unbrick.py --port COM4 --reset-line dtr id
 ```
-Python 3.8+. `ms41_variant.py` (bundled) provides the variant guard.
 
 ---
 
@@ -74,6 +92,9 @@ The `flash` command is **safe by default**. Without `--arm` it's a **dry run**: 
 the full plan — which block it will erase, the exact program window, and the variant
 check — and **does not open the serial port or touch the ECU at all**. Review the plan,
 then re-run the *same* command with `--arm` to actually erase + program + verify.
+
+> The examples use `python bsl_unbrick.py`; if you installed the **exe** or the **pip package**,
+> swap in `bsl_unbrick.exe` or `ms41-bsl-unbrick` instead — the arguments are identical.
 
 ```bash
 # confirm BSL entry (0x55) + that loaded code runs (0xA5) — no flash risk
