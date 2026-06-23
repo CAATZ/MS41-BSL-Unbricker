@@ -57,6 +57,8 @@ The connections below are made at the DME PCB test points shown here (The image 
 
 Note: A FTDI232 adapter is recommended.
 
+Note 2: You can optionally add a 0603 resistor on the white box marked in the picture. That would replace a full size 2.2K resistor between ALE and +5V.
+
 ---
 
 ## Install
