@@ -2,16 +2,12 @@
 
 In-circuit recovery tool for the BMW **MS41.x** ECU (Siemens **SAB 80C166** CPU +
 Intel **28F200** flash). It reprograms the **entire** 28F200 over the 80C166
-**bootstrap loader (BSL)** — no desoldering, no diagnostic session, every block
+**bootstrap loader (BSL)** — no desoldering the FLASH, no diagnostic session, every block
 including the boot/reset vectors.
 
 The BSL lives in CPU silicon and runs regardless of flash contents, so this
 recovers a fully corrupt, cross-flashed, or **blank** chip — the cases where the
 normal diagnostic flash path can't help.
-
-> **HW-proven** on an MS41.3: all five 28F200 erase blocks erased, programmed, and
-> read-back **verified** in-circuit; recovers from a bad/cross-variant calibration
-> as well as a wiped chip.
 
 ---
 
@@ -45,13 +41,16 @@ normal diagnostic flash path can't help.
 
 1. **Serial:** a direct TTL tap on ASC0 — **TxD0 (P3.10)** and **RxD0 (P3.11)** — to a
    3.3 V/5 V USB-serial adapter (FT232). Full-duplex direct tap is the only mode.
-2. **Force BSL at reset:** **ALE (pin 25) HIGH** and **NMI# (pin 29) LOW** while
-   **RSTIN# (pin 27)** is pulsed. Wire RSTIN# to the adapter's DTR and let the tool
-   pulse it with `--reset-line dtr` (active-low; add `--reset-invert` if a transistor
-   inverts the line).
+2. Connect GND from the adapter to DME GND.   
+3. **Force BSL at reset:** **ALE (pin 25) HIGH through a 2.2K resistor to +5V** and
+   **Connect ALE (pin 25) and NMI# (pin 29) together**
+4. Wire RSTIN# to the adapter's DTR and let the tool pulse it with `--reset-line dtr` (active-low;
+   add `--reset-invert` if a transistor inverts the line).
 3. **Programming voltage:** **12 V on the 28F200 VPP pin** is required for any
    erase/program. On this ECU VPP and RP# share a net, so that one 12 V supply also
    unlocks the HW-locked boot block (`program-mid`).
+
+Note: A FTDI232 adapter is recommended.
 
 ---
 
