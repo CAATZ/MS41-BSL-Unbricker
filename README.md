@@ -39,6 +39,10 @@ normal diagnostic flash path can't help.
 
 ## Hardware setup
 
+The connections below are made at the DME PCB test points shown here:
+
+![MS41 DME PCB — test points for the serial tap, BSL-entry straps, reset, and 12V](images/PCB_TP.PNG)
+
 1. **Serial:** a direct TTL tap on ASC0 — **TxD0 (P3.10)** and **RxD0 (P3.11)** — to a
    3.3 V/5 V USB-serial adapter (FT232). Full-duplex direct tap is the only mode.
 2. Connect GND from the adapter to DME GND.   
