@@ -178,4 +178,4 @@ Thanks also to **[grantUser](https://github.com/grantUser)** for collaborative i
 
 ## License
 
-MIT — see [LICENSE](LICENSE). (Set the copyright holder line in `LICENSE` before publishing.)
+MIT — see [LICENSE](LICENSE).
