@@ -21,10 +21,12 @@ Serial path: a direct full-duplex tap on ASC0 = TXD0 (P3.10) -> host RX and
 host TX -> RXD0 (P3.11), via an FT232.  (The Siemens BSL app-note warns against
 half-duplex / single-wire K-line, so this tool only supports the direct tap.)
 
-The whole 28F200 (boot, program, cal) is in-circuit erasable/programmable/verifiable
-over BSL — no bench programmer.  Everyday use is the `flash` command:
+The whole flash (boot, program, cal) is in-circuit erasable/programmable/verifiable
+over BSL — no bench programmer.  Both the original Intel 28F200 (Intel command set,
+needs 12V VPP) and the AMD/JEDEC 29F200/29F400 family (single-supply, no 12V) are
+supported; pick the command set with --chip.  Everyday use is the `flash` command:
 
-  flash <region|all> --ref <image> --arm   (DRY-RUN without --arm; needs 12V VPP)
+  flash <region|all> --ref <image> --arm   (DRY-RUN without --arm)
 
 Other commands: `sync` (confirm BSL entry + that loaded code runs), `dump` (read the
 chip to a .bin), `read`/`write`, `verify-alias`, `vpp-on`, `businfo`.  The low blocks
@@ -51,7 +53,7 @@ try:
 except ImportError:
     cks = None
 
-__version__ = "1.0.0"                   # bump on each release; tag the commit v<version> (see CHANGELOG.md)
+__version__ = "1.1.0"                   # bump on each release; tag the commit v<version> (see CHANGELOG.md)
 
 CAL_PARTIAL_SIZE = 24 * 1024           # a 24KB cal/tune partial (DS2 0x10000.., CPU-order)
 _SERIAL_ERRS = (serial.SerialException,) if serial else ()   # for top-level FT232 handling
@@ -219,22 +221,24 @@ class BSL:
         self.ser.flush()
 
     # ── load + drive the RAM monitor ───────────────────────────────────────
-    def start_monitor(self, log=print, flash=False):
+    def start_monitor(self, log=print, flash=False, amd=False):
         """sync -> load the 32-byte preloader -> feed it the monitor -> ping.
 
         The preloader (loaded by the BSL at 0xFA40) reads exactly MONITOR_LOAD_LEN
         bytes into IRAM 0xFA60 then jumps there.  Returns True if the monitor
-        answers a ping with 0xA5.  flash=True loads MONITOR_FLASH (P/R/E/F) instead
-        of the general MONITOR (P/R/W/C) — same preloader, same 0xFA60 entry.
+        answers a ping with 0xA5.  flash=True loads a flash monitor (P/R/E/F) instead
+        of the general MONITOR (P/R/W/C): MONITOR_FLASH_AMD if amd else MONITOR_FLASH —
+        same preloader, same 0xFA60 entry.
         """
         if not self.sync(log):
             return False
         log("loading preloader…")
         self.load_stub(PRELOADER)                 # 32-byte BSL frame; BSL jumps to it
         time.sleep(0.05)
-        mon = MONITOR_FLASH if flash else MONITOR
+        mon = (MONITOR_FLASH_AMD if amd else MONITOR_FLASH) if flash else MONITOR
+        label = "FLASH-AMD " if (flash and amd) else "FLASH " if flash else ""
         frame = bytes(mon).ljust(MONITOR_LOAD_LEN, b"\x00")
-        log(f"loading {'FLASH ' if flash else ''}monitor ({len(mon)} B, padded to {MONITOR_LOAD_LEN})…")
+        log(f"loading {label}monitor ({len(mon)} B, padded to {MONITOR_LOAD_LEN})…")
         self.ser.reset_input_buffer()
         self.ser.write(frame)
         self.ser.flush()
@@ -391,18 +395,20 @@ class BSL:
                 + ("" if set_ == on else "  (pin may be clamped by its load — trust the meter at VPP)"))
         return True
 
-    def mon_read_id(self, log=print):
-        """Read the 28F200 manufacturer + device ID via the Read-Identifier routine — loaded to
-        IRAM scratch with 'W' and launched with 'C' (the general monitor; this needs W+C, like
-        set_vpp).  The routine enables WR#, writes 0x90, reads chip words 0/1 through the
-        +0x40000 alias, writes 0xFF (read-array), and stashes the two ID words at 0xFCC0.
-        Non-destructive (no VPP).  Returns (manufacturer, device) or (None, None) on failure."""
-        if not self.mon_write(self._VPP_SCRATCH, READ_ID_ROUTINE):     # load to 0xFC80
+    def mon_read_id(self, routine=None, result_addr=0xFCC0, log=print):
+        """Read the flash manufacturer + device ID via a Read-Identifier routine — loaded to IRAM
+        scratch with 'W' and launched with 'C' (the general monitor; this needs W+C, like set_vpp).
+        Defaults to the 28F200 (Intel) READ_ID_ROUTINE, which writes 0x90, reads chip words 0/1
+        through the +0x40000 alias, writes 0xFF (read-array), and stashes the two ID words at 0xFCC0.
+        Pass routine=READ_ID_AMD_ROUTINE, result_addr=READ_ID_AMD_RESULT for the 29F200 AMD/JEDEC
+        autoselect.  Non-destructive (no VPP).  Returns (manufacturer, device) or (None, None)."""
+        routine = READ_ID_ROUTINE if routine is None else routine
+        if not self.mon_write(self._VPP_SCRATCH, routine):             # load to 0xFC80
             log("  read-id: routine load (W) not ACKed — monitor has no W?"); return None, None
         if not self.mon_call(self._VPP_SCRATCH):                       # run it
             log("  read-id: routine call (C) didn't return — monitor has no C, or bad routine.")
             return None, None
-        res = self.mon_read(0xFCC0, 4)                                 # mfr (LE) + device (LE)
+        res = self.mon_read(result_addr, 4)                            # mfr (LE) + device (LE)
         if len(res) < 4:
             return None, None
         return res[0] | (res[1] << 8), res[2] | (res[3] << 8)
@@ -516,6 +522,26 @@ MONITOR_FLASH = bytes.fromhex(
     "6FE36FE24860EA2002FC9AB7FE70F3FEB2FE7EB79AB7FE70F3FFB2FE7EB7E6F5"
     "4000B854B874E6F1FFFFE6F57000B854A90467F080003D0228113DF708422862"
     "0DE1E6F5FF00B8547EB6E6584B009AB6FE70EA0064FA")
+# MONITOR_FLASH_AMD (470 B): the AMD/JEDEC 29F200/29F400 flash monitor — same P/R/E/F protocol and
+# same MAIN/ping/read as MONITOR_FLASH, but E/F use the AMD command set (unlock AA@0x555/55@0x2AA,
+# erase 80/AA/55/30@sector, program A0+data) with DQ6 toggle-bit + DQ5 polling, and NO VPP (29F2/4xx
+# is single-supply, and on the retrofit board the 12V net feeds the chip's RESET#).  WORD command/
+# data writes (strobe WE#); BYTE status reads (DQ6/DQ5 in the low byte).  Word cmd addrs 0x555/0x2AA
+# are byte offsets 0xAAA/0x554 (x16 flash, flash A0 = CPU A1).  E replies a synthesized Intel-style
+# SR (0x80 ok / 0x20 fail) so the host's _decode_sr/erase check is reused unchanged; F replies 'K'.
+# asm/monitor_flash_amd.asm, Ghidra-built; == .hex byte-for-byte.  MONITOR_FLASH (28F200) is untouched.
+MONITOR_FLASH_AMD = bytes.fromhex(
+    "DFE3DFE29AB7FE70F3F0B2FE7EB747F05000EA2092FA47F05200EA20A0FA47F04500EA20F8FA47F04600EA2092FB"
+    "EA0064FAE658A5009AB6FE707EB6EA0064FA9AB7FE70F3F4B2FE7EB79AB7FE70F3F5B2FE7EB79AB7FE70F3F8B2FE"
+    "7EB79AB7FE70F3F9B2FE7EB79AB7FE70F3FCB2FE7EB79AB7FE70F3FDB2FE7EB7F6F200FE4860EA2064FAA9E47EB6"
+    "F6F7B0FE9AB6FE70084128610DF49AB7FE70F3F4B2FE7EB79AB7FE70F3F5B2FE7EB79AB7FE70F3F8B2FE7EB79AB7"
+    "FE70F3F9B2FE7EB7F6F200FEE6F25405E6F3AA0AE6F5AA00B853E6F55500B852E6F58000B853E6F5AA00B853E6F5"
+    "5500B852E6F53000B854E6F0002028013DFEE6F68000E6F1FFFFA904A9A4510A67F040002D0A67FA20003D042811"
+    "3DF528613DF1E6F720000D02E6F780007EB6F6F7B0FE9AB6FE70EA0064FA9AB7FE70F3F4B2FE7EB79AB7FE70F3F5"
+    "B2FE7EB79AB7FE70F3F8B2FE7EB79AB7FE70F3F9B2FE7EB79AB7FE70F3FCB2FE7EB79AB7FE70F3FDB2FE7EB7F6F2"
+    "00FEE6F25405E6F3AA0A4860EA2028FC9AB7FE70F3FEB2FE7EB79AB7FE70F3FFB2FE7EB7E6F5AA00B853E6F55500"
+    "B852E6F5A000B853B874E6F1FFFFA904A9A4510A67F040002D0567FA20003D0228113DF5084228620DD97EB6E658"
+    "4B009AB6FE70EA0064FA")
 # READ_ID_ROUTINE (44 B, loaded to IRAM scratch 0xFC80 via the general monitor's 'W', run via
 # 'C'): enable WR# (bset DP3.13/P3.13) / DPP0=0x11 / write 0x90 (Read ID) / read chip words 0,1
 # through the +0x40000 alias / write 0xFF (read-array) / store the two ID words at 0xFCC0.
@@ -523,6 +549,18 @@ MONITOR_FLASH = bytes.fromhex(
 # MONITOR_FLASH (the proven flash monitor stays byte-for-byte unchanged).
 READ_ID_ROUTINE = bytes.fromhex(
     "DFE3DFE2E6001100E004E6F59000B854A864E024A874E004E6F5FF00B854E6F4C0FCB864E6F4C2FCB874CB00")
+# READ_ID_AMD_ROUTINE (68 B): the 29F200 (AMD/JEDEC) autoselect, same harness as READ_ID_ROUTINE
+# but the AMD command set instead of Intel's single 0x90: unlock AA->word 0x555 / 55->word 0x2AA,
+# autoselect 90->word 0x555, read mfr (word 0) + device (word 1), reset F0.  The flash is x16 on a
+# byte bus (flash A0 = CPU A1) so the WORD addrs 0x555/0x2AA are BYTE offsets 0xAAA/0x554; the GAL
+# only inverts A14 (above A10) so the command decode is unaffected, and like the Intel routine it
+# goes through the +0x40000 shadow alias (chip0 = CPU 0x4000, BSL-shadowed).  Results land at
+# 0xFCE0/0xFCE2 (NOT 0xFCC0 — the longer AMD body would overwrite its own tail there).  Non-
+# destructive: no VPP, no erase/program; F0 restores read-array.  asm/read_id_amd.asm, Ghidra-built.
+READ_ID_AMD_ROUTINE = bytes.fromhex(
+    "DFE3DFE2E6001100E6F4AA0AE6F5AA00B854E6F45405E6F55500B854E6F4AA0AE6F59000B854E004A864E024"
+    "A874E004E6F5F000B854E6F4E0FCB864E6F4E2FCB874CB00")
+READ_ID_AMD_RESULT = 0xFCE0    # where READ_ID_AMD_ROUTINE stashes (mfr, device); host reads it back
 
 
 def _bsl(args):
@@ -595,20 +633,31 @@ def cmd_dump(args):
     if args.range:
         s, _, e = args.range.partition(":")
         start, end = int(s, 0), int(e, 0)
-    # auto shadow-bypass: if the dump touches 0x0-0x7FFF and it's shadowed but the +0x40000
-    # wrap-around reads real flash, route the low range through the alias.
+    # auto shadow-bypass: if the dump touches 0x0-0x7FFF and the direct read isn't real flash
+    # (the BSL boot-ROM shadow on the 28F200, OR plain 0xFF on the 29F400 retrofit) while the
+    # +0x40000 wrap-around does read flash, route the low range through the alias.  Decide from
+    # CONTENT, not the boot-ROM signature, so it works on both chips (mirrors _flash_region).
     alias_low = False
     if start < BSL_SHADOW_HI and not args.no_alias:
-        direct = bsl.mon_read(0x0, 4)
-        if direct == BSL_BOOTROM_SIG:
-            alias = bsl.mon_read(BSL_ALIAS, 4)
-            if alias != BSL_BOOTROM_SIG and any(b != 0xFF for b in alias):
-                alias_low = True
-                print(f"  0x0-0x7FFF is BSL-shadowed but the +0x{BSL_ALIAS:X} alias reads real "
-                      f"flash — routing the low range through the wrap-around.")
-            else:
-                print("  0x0-0x7FFF shadowed and the alias didn't read flash — the low range "
-                      "will be the raw shadow.")
+        direct = bsl.mon_read(0x0, 16)
+        alias  = bsl.mon_read(BSL_ALIAS, 16)
+
+        def _is_flash(d):   # plausibly real flash: not the boot-ROM shadow, not blank 0xFF
+            return len(d) >= 4 and d[:4] != BSL_BOOTROM_SIG and any(b != 0xFF for b in d)
+
+        if _is_flash(direct):
+            print("  0x0-0x7FFF reads real flash directly — no alias needed.")
+        elif _is_flash(alias):
+            alias_low = True
+            print(f"  0x0-0x7FFF is shadowed/blank but the +0x{BSL_ALIAS:X} alias reads real flash "
+                  f"— routing the low range through the wrap-around.")
+        elif alias[:4] != BSL_BOOTROM_SIG:
+            alias_low = True
+            print(f"  0x0-0x7FFF blank/ambiguous — routing the low range through the +0x{BSL_ALIAS:X} "
+                  f"alias (the shadowed-low default).")
+        else:
+            print("  0x0-0x7FFF shadowed and the alias didn't read flash — the low range will be "
+                  "the raw shadow.")
     print(f"dumping physical 0x{start:X}..0x{end:X} ({end - start} bytes) — "
           f"~{(end - start) * 10 / args.baud:.0f}s at {args.baud} baud…")
     if not args.raw_hole and start < BSL_HOLE[1] and end > BSL_HOLE[0]:
@@ -684,29 +733,76 @@ def cmd_businfo(args):
     return 0
 
 
-# Known 28F200 IDs (manufacturer 0x0089 = Intel).  The MS41 uses the bottom-boot -B.
+# JEDEC manufacturer codes seen on MS41-class 2 Mbit boot-block flash.
+_FLASH_MFR = {
+    0x0089: "Intel",          0x0001: "AMD/Spansion", 0x0004: "Fujitsu",
+    0x0020: "STMicro",        0x00C2: "Macronix",     0x00BF: "SST",
+    0x001F: "Atmel",          0x0037: "AMIC",
+}
+# Known boot-block flash IDs.  Intel 28F200 = Intel command set; the 29F200/29F400 families
+# (AMD/Fujitsu/ST/Macronix … — all AMD/JEDEC command set) share device codes across second
+# sources.  Device code suffix: 0x2257/0x2251 = 29F200 (2 Mbit) bottom/top; 0x22AB/0x2223 =
+# 29F400 (4 Mbit) bottom/top.  HW-CONFIRMED on the MS41 retrofit (2026-06-22): mfr 0x0001 (AMD)
+# device 0x22AB = Am29F400BB.  The 29F200 codes below are documented/best-effort — the live `id`
+# readout is the ground truth (the Intel table was likewise confirmed on HW).
 _FLASH_IDS = {
     (0x0089, 0x2274): "Intel 28F200BX-T  (2 Mbit, top-boot)",
     (0x0089, 0x2275): "Intel 28F200BX-B  (2 Mbit, bottom-boot)",
+    # 29F200 family — 2 Mbit / 256 KB:
+    (0x0001, 0x2257): "AMD Am29F200BB  (2 Mbit, bottom-boot)",
+    (0x0001, 0x2251): "AMD Am29F200BT  (2 Mbit, top-boot)",
+    (0x0004, 0x2257): "Fujitsu MBM29F200BC  (2 Mbit, bottom-boot)",
+    (0x0004, 0x2251): "Fujitsu MBM29F200TC  (2 Mbit, top-boot)",
+    (0x0020, 0x2257): "ST M29F200BB  (2 Mbit, bottom-boot)",
+    (0x0020, 0x2251): "ST M29F200BT  (2 Mbit, top-boot)",
+    (0x00C2, 0x2257): "Macronix MX29F200B  (2 Mbit, bottom-boot)",
+    (0x00C2, 0x2251): "Macronix MX29F200T  (2 Mbit, top-boot)",
+    # 29F400 family — 4 Mbit / 512 KB (same AMD/JEDEC command set):
+    (0x0001, 0x22AB): "AMD Am29F400BB  (4 Mbit, bottom-boot)  [HW-confirmed on this ECU]",
+    (0x0001, 0x2223): "AMD Am29F400BT  (4 Mbit, top-boot)",
+    (0x0004, 0x22AB): "Fujitsu MBM29F400BC  (4 Mbit, bottom-boot)",
+    (0x0004, 0x2223): "Fujitsu MBM29F400TC  (4 Mbit, top-boot)",
+    (0x00C2, 0x22AB): "Macronix MX29F400B  (4 Mbit, bottom-boot)",
+    (0x00C2, 0x2223): "Macronix MX29F400T  (4 Mbit, top-boot)",
 }
+
+
+_CMDSET_NAME = {"intel": "Intel", "amd": "AMD/JEDEC"}   # for the per-method readout label
 
 
 def cmd_id(args):
     bsl = _monitor(args)
     if not bsl:
         return 1
-    mfr, dev = bsl.mon_read_id()
-    if mfr is None:
-        print("RESULT: could not read the flash ID (the routine failed to load/run)."); return 1
-    print(f"  manufacturer : 0x{mfr:04X}{'  (Intel)' if mfr == 0x0089 else ''}")
-    print(f"  device       : 0x{dev:04X}")
-    name = _FLASH_IDS.get((mfr, dev))
-    if name:
-        print(f"RESULT: {name} — confirmed.")
+    # which command set(s) to try: a known --chip forces one; 'auto' tries Intel then AMD.
+    order = {"28f200": ["intel"], "29f200": ["amd"], "29f400": ["amd"],
+             "auto": ["intel", "amd"]}[args.chip]
+    match = None
+    for kind in order:
+        if kind == "amd":
+            mfr, dev = bsl.mon_read_id(READ_ID_AMD_ROUTINE, READ_ID_AMD_RESULT)
+        else:
+            mfr, dev = bsl.mon_read_id()                       # 28F200 / Intel default
+        cmdset = _CMDSET_NAME[kind]
+        if mfr is None:
+            print(f"  [{cmdset:9}] read-id routine failed to load/run.")
+            continue
+        name = _FLASH_IDS.get((mfr, dev))
+        mfr_name = _FLASH_MFR.get(mfr)
+        print(f"  [{cmdset:9}] manufacturer 0x{mfr:04X}"
+              f"{'  (' + mfr_name + ')' if mfr_name else ''}   device 0x{dev:04X}"
+              f"{'   = ' + name if name else ''}")
+        if name:
+            match = (cmdset, mfr, dev, name)
+            break
+    if match:
+        cmdset, mfr, dev, name = match
+        print(f"RESULT: {name} — confirmed via the {cmdset} command set.")
         return 0
-    print("RESULT: ID read back, but (0x%04X, 0x%04X) isn't in the known table. If those look "
-          "like flash contents rather than 0x0089/0x22xx, the Read-ID command didn't latch "
-          "(WR#/alias) even though the read path worked." % (mfr, dev))
+    print("RESULT: ID read back, but no (manufacturer, device) matched the known table. If a real "
+          "manufacturer code shows above (e.g. 0x0001 AMD / 0x0004 Fujitsu / 0x0020 ST) with an "
+          "unlisted device, note it and we'll add the exact part. If both methods returned "
+          "flash-looking bytes, the Read-ID command didn't latch (WR#/alias) — check the tap.")
     return 0
 
 
@@ -747,6 +843,80 @@ FLASH_REGIONS = {
     "tune":         dict(erase=0x10000, span=(0x08000, 0x20000), hole=BSL_HOLE),  # ->main D 96K cal/tune; CPU 0xC000-0xFFFF unmapped (BSL_HOLE)
     "program-high": dict(erase=0x20000, span=(0x20000, 0x40000)),                       # ->main E 128K
 }
+# 29F400 (AMD/JEDEC) erase-SECTOR map for the FACTORY strap (Flash A17 HIGH).  On the Am29F400BB
+# (bottom-boot, 512 KB) A17-high routes the CPU to the chip's UPPER 256 KB = FOUR UNIFORM 64 KB
+# sectors (datasheet Table 3, A17=1): SA7 (CPU 0x0-0xFFFF), SA8 (0x10000-0x1FFFF), SA9 (0x20000-
+# 0x2FFFF), SA10 (0x30000-0x3FFFF).  The fine boot sectors (16K/8K/8K/32K) sit in the UNUSED lower
+# half.  CPU addr = chip XOR 0x4000; erase is sector-granular (AMD 0x30@sector); single-supply (NO 12V).
+# Region -> sector mapping:
+#   `low`          = SA7 (64 KB): its low 32 KB (CPU 0x0-0x7FFF) holds boot+program-low+bootloader+
+#                    drivers; the upper 32 KB (0x8000-0xFFFF) is the empty gap + unmapped hole (left erased).
+#   `tune`         = SA8 (64 KB): cal.
+#   `program-high` = SA9 + SA10 (two 64 KB): main maps.
+# HW-confirmed (Am29F400BB, cal magic @CPU 0x10000).  NOTE: a genuine 29F200 (256 KB, no A17 tie-off)
+# exposes its real bottom-boot small sectors instead, so this UPPER map is 29F400-specific (unverified
+# on a true 29F200); the A17-low rewire uses FLASH_REGIONS_AMD_LOWER below.
+FLASH_REGIONS_AMD = {
+    # ★ CPU 0x0-0xFFFF is ONE 64K sector (the chip's SA7).  WHY: this board straps the 29F400's A17
+    # HIGH — the 256K 28F200 it replaced had no A17, so the board never routed it (netlist: Flash A16
+    # = CPU A17, Flash A17 = pull-up).  A17 high => the CPU only sees the chip's UPPER 256K, which on
+    # a bottom-boot Am29F400B is four UNIFORM 64K sectors (SA7-SA10) — the small boot sectors sit in
+    # the unused LOWER half.  So boot + program-low + program-mid all live inside SA7 and erase as a
+    # unit (HW-PROVEN 2026-06-23: erasing any one wiped all three; cf. tune=1 sector, program-high=2).
+    # `low` IS that 64K sector: one erase clears it; we program/verify only the 0x0-0x7FFF data
+    # (0x8000-0xFFFF is the empty gap + the unmapped hole).  A per-region flash of boot/program-low/
+    # program-mid separately would brick — they aren't separate sectors here.  (No WP#: SA7 is a
+    # middle upper-half sector, not one of the two WP#-protectable outermost boot sectors.)
+    "low":          dict(erase=0x00000, span=(0x00000, 0x08000), low=True),
+    "tune":         dict(erase=0x10000, span=(0x10000, 0x20000)),                      # SA8 64K (CPU 0x10000-0x1FFFF): cal/tune (no hole)
+    "program-high": dict(erase=(0x20000, 0x30000), span=(0x20000, 0x40000)),           # SA9+SA10 (two 64K): two erases
+}
+
+
+# A17-LOW (lower-half) AMD map — HW-VALIDATED 2026-06-27 (retrofit A17-low strap).  The factory board
+# straps Flash A17 HIGH (pull-up), so the CPU sees the chip's UPPER 256K = four uniform 64K sectors (the
+# FLASH_REGIONS_AMD map above).  If A17 is REWIRED LOW, the CPU instead sees the chip's LOWER 256K, which
+# on a bottom-boot Am29F400B is the REAL boot-block region: small sectors SA1 8K (CPU 0x0, vectors) / SA2
+# 8K (CPU 0x2000) / SA0 16K (CPU 0x4000) + SA4-6 64K.  Then boot/program-low/program-mid are SEPARATE
+# sectors that erase individually (no 64K group erase), and program-mid (SA0) is one of the two
+# WP#-protectable outermost boot sectors.  tune/program-high use the SAME CPU erase addresses as the upper
+# map (the strap only re-routes them to other physical 64K sectors, transparent to the tool).  CAVEAT:
+# selecting the lower half points the CPU at a (likely blank) half — the image must be re-flashed there
+# first.  HW-PROVEN 2026-06-27: the custom MS41.3 SA1 bootloader was flashed via `--half lower flash boot`
+# on the retrofit Am29F400BB and ran end-to-end (boot CRC OK, agent executed at 0xD800) — this is the
+# proven path for the A17-low retrofit; FLASH_REGIONS_AMD above stays the proven path for the factory
+# A17-high strap.
+FLASH_REGIONS_AMD_LOWER = {
+    "boot":         dict(erase=0x00000, span=(0x00000, 0x02000), low=True),            # SA1 8K (chip 0x4000): vectors
+    "program-low":  dict(erase=0x02000, span=(0x02000, 0x04000), low=True),            # SA2 8K (chip 0x6000)
+    "program-mid":  dict(erase=0x04000, span=(0x04000, 0x08000), low=True, wp=True),   # SA0 16K (chip 0x0): bottom-boot, WP#-protectable
+    "tune":         dict(erase=0x10000, span=(0x10000, 0x20000)),                      # SA4 64K
+    "program-high": dict(erase=(0x20000, 0x30000), span=(0x20000, 0x40000)),           # SA5+SA6
+}
+
+
+def _flash_profile(chip, half="upper"):
+    """Pick (amd_monitor?, regions_map, label) for `flash` from --chip and --half.  28f200/auto keep
+    the proven Intel path.  29f200/29f400 use the AMD command set.
+
+    The 29F200 is a 256K bottom-boot chip with NO A17 pin, so it presents the fine bottom-boot
+    sectors natively — it IS the 29F400's lower half.  --chip 29f200 therefore always uses the
+    fine-sector map (FLASH_REGIONS_AMD_LOWER); --half does not apply.
+
+    The 29F400 is 512K with A17.  --half picks the sector map for the board's Flash-A17 strap:
+    'upper' (A17 high, factory pull-up — CPU sees the chip's upper 256K = four 64K sectors, the
+    boot region is one `low` unit; PROVEN on the factory strap 2026-06-23) or 'lower' (A17 rewired
+    low — CPU sees the real bottom-boot small sectors; PROVEN on the retrofit A17-low config
+    2026-06-27, the path that flashed the SA1 bootloader)."""
+    if chip == "29f200":
+        return True, FLASH_REGIONS_AMD_LOWER, ("29F200 (256K, no A17 — native bottom-boot fine "
+                                               "sectors), AMD command set, no 12V")
+    if chip == "29f400":
+        if half == "lower":
+            return True, FLASH_REGIONS_AMD_LOWER, ("29F400 LOWER half (A17 low) — small boot "
+                                                   "sectors, HW-validated 2026-06-27 (retrofit), no 12V")
+        return True, FLASH_REGIONS_AMD, "29F400 upper half (A17 high, factory) — no 12V"
+    return False, FLASH_REGIONS, "28F200 (Intel command set, needs 12V VPP)"
 
 
 def _file_to_phys(ref, lo, hi):
@@ -791,15 +961,15 @@ def _decode_sr(sr):
     return f"0x{sr:02X} [" + ", ".join(bits) + "]"
 
 
-FLASH_ALL_ORDER = ["boot", "program-low", "program-mid", "tune", "program-high"]
 
-
-def _region_plan(args, region, ref):
-    """Geometry + reference bytes (physical order) for one region.  Returns a dict;
-    raises ValueError(msg) if `ref` is the wrong kind/size for this region."""
-    spec = FLASH_REGIONS[region]
-    erase_addr, (lo, hi) = spec["erase"], spec["span"]
-    low, rp12 = spec.get("low", False), spec.get("rp12", False)
+def _region_plan(args, region, ref, regions):
+    """Geometry + reference bytes (physical order) for one region of the given regions map.
+    Returns a dict; raises ValueError(msg) if `ref` is the wrong kind/size for this region."""
+    spec = regions[region]
+    erase = spec["erase"]
+    erase_addrs = list(erase) if isinstance(erase, (list, tuple)) else [erase]   # 1+ sector bases
+    (lo, hi) = spec["span"]
+    low, rp12, wp = spec.get("low", False), spec.get("rp12", False), spec.get("wp", False)
     hole = spec.get("hole")                        # (h_lo,h_hi) CPU range: unmapped, never touch
     in_hole = (lambda a: bool(hole) and hole[0] <= a < hole[1])
 
@@ -832,19 +1002,23 @@ def _region_plan(args, region, ref):
             if h1 < w_hi: prog_chunks.append((h1, w_hi))
         else:
             prog_chunks.append((w_lo, w_hi))
-    return dict(erase_addr=erase_addr, lo=lo, hi=hi, low=low, rp12=rp12, hole=hole,
+    return dict(erase_addrs=erase_addrs, lo=lo, hi=hi, low=low, rp12=rp12, wp=wp, hole=hole,
                 in_hole=in_hole, refdata=refdata, w_lo=w_lo, w_hi=w_hi,
                 prog_chunks=prog_chunks, is_partial=is_partial)
 
 
-def _print_plan(args, region, p, ref):
+def _print_plan(args, region, p, ref, amd=False):
     lo, hi, w_lo, w_hi = p["lo"], p["hi"], p["w_lo"], p["w_hi"]
     refdata, hole = p["refdata"], p["hole"]
     kind = "24KB cal partial" if p["is_partial"] else "file-order"
+    ea = p["erase_addrs"]
     print(f"== FLASH PLAN: region '{region}' ==")
     print(f"  reference     : {args.ref} ({len(ref)} B, {kind})")
-    print(f"  erase block   : 0x{p['erase_addr']:05X}  -> erases the whole 0x{lo:05X}..0x{hi:05X} "
-          f"block ({hi - lo} B, granular)")
+    unit = "sector" if amd else "block"
+    low_note = "  (SA7 is a 64 KB sector; only its low 32 KB is mapped data)" if (amd and region == "low") else ""
+    print(f"  erase {'sectors' if len(ea) > 1 else 'block  '}: {', '.join('0x%05X' % a for a in ea)}"
+          f"  -> {unit}-granular erase: clears the WHOLE {unit}(s) containing the listed address(es)"
+          f"{low_note}")
     print(f"  program window: 0x{lo + w_lo:05X}..0x{lo + w_hi:05X}  ({w_hi - w_lo} B of real data; "
           f"rest of block stays 0xFF)")
     if hole:
@@ -861,12 +1035,21 @@ def _print_plan(args, region, p, ref):
     if p["rp12"]:
         print( "  ** RP#=12V    : 28F200 HW-LOCKED boot block — RP# must be 11.4-12.6V for the "
                "erase/program. On this ECU RP# shares the VPP net, so the VPP 12V covers it.")
+    if p["wp"]:
+        print( "  ** WP#        : 29F2xx/4xx bottom-boot sector — WP#-protectable. If WP# (the old "
+               "VPP-net pin on the retrofit) sits low this sector is locked: erase/program no-op and "
+               "the read-back verify will flag it. The cal/main sectors are NOT WP#-gated.")
     if p["low"]:
         print( "  ** BSL SHADOW : 0x0-0x7FFF is overlaid by the BSL bootstrap-ROM; the run "
                "pre-flights phys 0x0 and, if shadowed, routes ALL ops for this region")
         print(f"                  through the +0x{BSL_ALIAS:X} wrap-around alias (reaches the "
                "real flash).")
-    print( "  REQUIRES      : 12V on the 28F200 VPP pin (else erase/program no-op; SR.3 flags it)")
+    if amd:
+        print( "  REQUIRES      : NO 12V — 29F2xx/4xx is single-supply (makes its own program "
+               "voltage). The monitor drives WR# only; the 12V VPP net stays OFF (it feeds the "
+               "chip's RESET# on this retrofit).")
+    else:
+        print( "  REQUIRES      : 12V on the 28F200 VPP pin (else erase/program no-op; SR.3 flags it)")
 
 
 def _variant_guard(bsl, args, ref):
@@ -929,7 +1112,9 @@ def _checksum_guard(args, ref, regions):
 
     st = cks.checksum_status(ref)
     involves_cal = "tune" in regions
-    involves_prog = bool({"boot", "program-low", "program-mid", "program-high"} & set(regions))
+    # "low" (the 64 KB SA7 sector; its low 32 KB holds boot + program-low + bootloader) writes the
+    # boot + program-low data, so it affects both the boot and program checksums — treat it as program-involving.
+    involves_prog = bool({"boot", "program-low", "program-mid", "program-high", "low"} & set(regions))
     hard = False
     if involves_cal and st["cal"] is False:
         if st["cal_disabled"]:
@@ -951,27 +1136,38 @@ def _checksum_guard(args, ref, regions):
     return ref, hard
 
 
-def _flash_region(bsl, args, region, p):
+def _flash_region(bsl, args, region, p, amd=False):
     """Erase + program + verify one region using an already-started monitor.  0=ok, 1=fail."""
     lo, hi, refdata, hole = p["lo"], p["hi"], p["refdata"], p["hole"]
-    in_hole, rp12, erase_addr = p["in_hole"], p["rp12"], p["erase_addr"]
+    in_hole, rp12, erase_addrs = p["in_hole"], p["rp12"], p["erase_addrs"]
     print(f"\n-- '{region}'  (0x{lo:05X}..0x{hi:05X}) --")
 
-    # shadow pre-flight for the low blocks -> route ALL ops through the +BSL_ALIAS wrap-around
+    # shadow pre-flight for the low blocks -> route ALL ops through the +BSL_ALIAS wrap-around.
+    # We decide from CONTENT, not the boot-ROM signature: the 28F200 shows the boot-ROM sig at direct
+    # 0x0 while the 29F400 retrofit shows 0xFF there — in both the REAL low data is only via the alias.
     acc = 0
     if p["low"]:
-        head = bsl.mon_read(0x0, 16)
+        head  = bsl.mon_read(0x0, 16)
+        ahead = bsl.mon_read(BSL_ALIAS, 16)
         print(f"  phys 0x0 read : {head.hex(' ') or '<nothing>'}")
-        if head[:4] == BSL_BOOTROM_SIG:
-            ahead = bsl.mon_read(BSL_ALIAS, 16)
-            print(f"  alias 0x{BSL_ALIAS:05X}: {ahead.hex(' ') or '<nothing>'}")
-            if ahead[:4] == BSL_BOOTROM_SIG or all(b == 0xFF for b in ahead):
-                print("RESULT: 0x0-0x7FFF shadowed AND the +0x40000 alias did not read flash -> "
-                      "region unreachable here. Nothing erased."); return 1
+        print(f"  alias 0x{BSL_ALIAS:05X}: {ahead.hex(' ') or '<nothing>'}")
+
+        def _is_flash(d):   # plausibly real flash: not the boot-ROM shadow, not blank 0xFF
+            return len(d) >= 4 and d[:4] != BSL_BOOTROM_SIG and any(x != 0xFF for x in d)
+
+        if _is_flash(head):
+            print("  (direct 0x0 reads real flash — shadow absent; addressing directly)")
+        elif _is_flash(ahead):
             acc = BSL_ALIAS
-            print(f"  shadow bypass : routing all ops through +0x{BSL_ALIAS:X}.")
+            print(f"  shadow bypass : direct 0x0 isn't real flash (shadow/blank); the +0x{BSL_ALIAS:X} "
+                  f"alias reads flash -> routing ALL ops for this region through it.")
+        elif ahead[:4] != BSL_BOOTROM_SIG:
+            acc = BSL_ALIAS     # both sides blank/ambiguous (virgin low region) but alias isn't the
+            print(f"  shadow bypass : 0x0 region blank/ambiguous; routing through +0x{BSL_ALIAS:X} "
+                  f"(the shadowed-low default — run `verify-alias` to confirm the wrap first).")
         else:
-            print("  (no boot-ROM signature — shadow absent; addressing directly)")
+            print("RESULT: 0x0-0x7FFF shadowed AND the +0x40000 alias did not read flash -> "
+                  "region unreachable here. Nothing erased."); return 1
 
     if not args.no_backup:
         before = bsl.mon_read(lo + acc, hi - lo, progress=_make_bar("backup"))
@@ -980,14 +1176,24 @@ def _flash_region(bsl, args, region, p):
             f.write(before)
         print(f"  backup        : saved {len(before)} B of current 0x{lo:05X}.. to {bpath}")
 
-    print(f"  erasing 0x{erase_addr:05X} (whole {hi - lo} B block)" +
-          (f" via alias 0x{erase_addr + acc:05X}" if acc else "") + "…")
-    sr = bsl.mon_erase(erase_addr + acc)
-    print(f"  erase status  : {_decode_sr(sr)}")
-    if sr is None or not (sr & 0x80) or (sr & 0x28):
-        print("RESULT: erase did NOT complete cleanly — aborting before any program. Check the "
-              "12V VPP supply" + (" (RP# shares it for the boot block)" if rp12 else "") + ".")
-        return 1
+    for ea in erase_addrs:
+        print(f"  erasing 0x{ea:05X}" + (f" via alias 0x{ea + acc:05X}" if acc else "") +
+              (f"  ({len(erase_addrs)} sectors in this span)" if len(erase_addrs) > 1 else
+               f"  (whole {hi - lo} B block)") + "…")
+        sr = bsl.mon_erase(ea + acc)
+        print(f"  erase status  : {_decode_sr(sr)}")
+        if sr is None or not (sr & 0x80) or (sr & 0x28):
+            if p.get("wp"):
+                hint = "this is the WP#-protected bottom-boot sector — its WP# pin is likely held low"
+            elif amd:
+                hint = ("a 29F2xx/4xx erase shouldn't VPP-fail (single-supply) — suspect the WR#/bus "
+                        "or that this sector is WP#-locked")
+            elif rp12:
+                hint = "check the 12V VPP supply (RP# shares it for this HW-locked block)"
+            else:
+                hint = "check the 12V VPP supply (else the 28F200 erase no-ops; SR.3 flags it)"
+            print(f"RESULT: erase did NOT complete cleanly — aborting before any program. {hint}.")
+            return 1
 
     chk = bsl.mon_read(lo + acc, hi - lo, progress=_make_bar("post-erase"))  # erase reached flash?
     bad = next((lo + i for i, b in enumerate(chk) if b != 0xFF and not in_hole(lo + i)), None)
@@ -1020,7 +1226,8 @@ def _flash_region(bsl, args, region, p):
         i = diffs[0]
         print(f"  first diff @0x{lo + i:05X}: flash {back[i]:02X} vs ref {refdata[i]:02X}")
     print("RESULT: VERIFY MISMATCH. If read-back is all-0xFF the writes didn't reach the flash "
-          "(no VPP); else the reference differs from what was programmed.")
+          + ("(WR#/WP#, or wrong sector)" if amd else "(no VPP)")
+          + "; else the reference differs from what was programmed.")
     return 1
 
 
@@ -1033,9 +1240,31 @@ def cmd_flash(args):
     except OSError as e:
         print(f"cannot open --ref: {e}"); return 2
 
+    amd, regions_map, chip_label = _flash_profile(args.chip, args.half)
+    print(f"== FLASH CHIP: {chip_label} ==")
+    if args.chip == "auto":
+        print("  (--chip auto -> assuming 28F200 for `flash`; pass --chip 29f400 / 29f200 for the "
+              "AMD chip. `id` auto-detects, but the erase geometry differs, so flash needs it stated.)")
+    if args.chip == "29f200":
+        print("  ** NOTE: a 29F200 has no A17 pin, so it presents the bottom-boot fine sectors "
+              "natively (no rewire, no --half). This map is the 29F400's lower half, which was "
+              "HW-validated 2026-06-27.")
+    elif args.chip == "29f400" and args.half == "lower":
+        print("  ** NOTE: --half lower assumes Flash A17 is strapped LOW (rewired from the factory "
+              "pull-up). This requires a GAL change first — reprogram the GAL to drop its A17 decode "
+              "dependency, OR cut the trace between flash pin 3 (A17) and the GAL — otherwise pulling "
+              "A17 low deasserts the RAM/CAN chip-selects and kills the ECU. The map is HW-VALIDATED "
+              "(2026-06-27 — it flashed the SA1 bootloader end-to-end on the retrofit Am29F400BB), but "
+              "it is strap-specific: on a factory A17-high board use --half upper instead, and the "
+              "image must already exist in the lower half. Dry-run and verify carefully.")
+
+    if args.region != "all" and args.region not in regions_map:
+        print(f"region '{args.region}' isn't valid for this chip ({chip_label}). "
+              f"Valid regions: {', '.join(regions_map)}, all.")
+        return 2
     if args.region == "all":
-        regions = list(FLASH_ALL_ORDER)
-        need = FLASH_REGIONS["program-high"]["span"][1]
+        regions = list(regions_map)            # map order is the flash order (low->tune->program-high, etc.)
+        need = regions_map["program-high"]["span"][1]
         if len(ref) < need:
             print(f"'all' needs a full file-order image (>= 0x{need:X} B); got {len(ref)} B.")
             return 2
@@ -1046,12 +1275,12 @@ def cmd_flash(args):
     ref, ck_block = _checksum_guard(args, ref, regions)
 
     try:
-        plans = {r: _region_plan(args, r, ref) for r in regions}
+        plans = {r: _region_plan(args, r, ref, regions_map) for r in regions}
     except ValueError as e:
         print(str(e)); return 2
 
     for r in regions:
-        _print_plan(args, r, plans[r], ref)
+        _print_plan(args, r, plans[r], ref, amd=amd)
     involves_cal = "tune" in regions
     note = "" if (MS41ECU or not involves_cal) else "; ms41_variant.py missing -> SKIPPED"
     print(f"\n  variant guard : {'ON (checked against the ECU when armed)' if involves_cal else 'n/a (no cal here)'}{note}")
@@ -1068,18 +1297,21 @@ def cmd_flash(args):
 
     print("\n--arm given: executing.")
     bsl = _bsl(args)
-    if not bsl.start_monitor(flash=True):
+    if not bsl.start_monitor(flash=True, amd=amd):
         print("RESULT: flash monitor did not come up (no 0xA5). Check wiring/timing."); return 1
-    # The monitor enables WR# (P3.13) at entry and VPP (P2.6/P3.6) at the first erase, then leaves
-    # both ON for the rest of the session (a reset clears them) — see MONITOR_FLASH.  One monitor
-    # load services every region of an 'all' run.
-    print("  vpp/wr#       : monitor drives WR# (P3.13) from entry and VPP (P2.6) from the first "
-          "erase, held on through programming; a reset clears them.")
+    # One monitor load services every region of an 'all' run.  The Intel monitor enables WR# (P3.13)
+    # at entry and the VPP gate (P2.6) at the first erase, held on; the AMD monitor enables WR# only
+    # (no VPP — single-supply chip).  A reset clears the port bits either way.
+    if amd:
+        print("  wr#           : AMD monitor drives WR# (P3.13) from entry; NO 12V/VPP (P2.6 stays off).")
+    else:
+        print("  vpp/wr#       : monitor drives WR# (P3.13) from entry and VPP (P2.6) from the first "
+              "erase, held on through programming; a reset clears them.")
     if involves_cal and _variant_guard(bsl, args, ref):
         return 1
 
     for r in regions:
-        rc = _flash_region(bsl, args, r, plans[r])
+        rc = _flash_region(bsl, args, r, plans[r], amd=amd)
         if rc:
             if len(regions) > 1:
                 print(f"\nRESULT: 'all' STOPPED at '{r}'. Earlier regions are flashed; re-run to "
@@ -1119,6 +1351,22 @@ def main():
     ap.add_argument("--reset-invert", action="store_true",
                     help="invert reset polarity — use if a transistor/inverter sits between the "
                          "FTDI pin and RSTIN# (so the line must go HIGH to assert reset).")
+    ap.add_argument("--half", choices=["upper", "lower"], default="upper",
+                    help="29F400 only: which chip half the board's Flash-A17 strap selects. "
+                         "'upper' (default; A17 high = factory pull-up) is the PROVEN factory-strap path. "
+                         "'lower' (A17 rewired low) exposes the real bottom-boot small sectors — "
+                         "HW-validated 2026-06-27 (the retrofit path that flashed the SA1 bootloader). "
+                         "Going low needs a GAL change first (drop its A17 decode dependency, or cut the "
+                         "flash-pin-3-to-GAL trace), else RAM/CAN deassert and the ECU dies; re-flash the "
+                         "image into that half first. Ignored for 28F200 and 29F200 (a 29F200 has no A17 "
+                         "and always uses the bottom-boot fine sectors).")
+    ap.add_argument("--chip", choices=["auto", "28f200", "29f200", "29f400"], default="auto",
+                    help="flash command set: 28f200 = Intel (status-register, needs 12V VPP); "
+                         "29f200/29f400 = AMD/JEDEC (unlock-cycle + data-poll, single-supply, no 12V) "
+                         "— identical command set, they differ only in sector map. 29f200 (2 Mbit, no "
+                         "A17) uses the native bottom-boot fine sectors; 29f400 (4 Mbit) uses --half "
+                         "to pick the A17 strap's half. 'auto' (default) tries Intel then AMD for the "
+                         "`id` command and assumes 28F200 for `flash`.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ports", help="list serial ports")
     sub.add_parser("sync", help="confirm BSL entry (0x55) and that loaded code runs (0xA5)")
@@ -1150,20 +1398,26 @@ def main():
     sub.add_parser("vpp-on", help="switch VPP (P2.6) on so you can meter ~12V at the 28F200 "
                                   "VPP pin; any other command resets it")
     sub.add_parser("businfo", help="read SYSCON/BUSCON/ADDRSEL to inspect the bus config")
-    sub.add_parser("id", help="read the flash chip's manufacturer + device ID (28F200 Read "
-                              "Identifier; non-destructive, no 12V needed)")
+    sub.add_parser("id", help="read the flash chip's manufacturer + device ID (non-destructive, no "
+                              "12V). Honors --chip: auto (default) tries the Intel 28F200 then the "
+                              "AMD/JEDEC 29F200 autoselect; --chip 29f200 forces the AMD command set.")
 
-    fp = sub.add_parser("flash", help="28F200 erase+program+verify a region from a reference "
-                                      "(DRY-RUN unless --arm). NEEDS 12V on VPP/RP#.")
-    fp.add_argument("region", choices=list(FLASH_REGIONS) + ["all"],
-                    help="28F200 erase-block (CPU addrs; chip block = XOR 0x4000): "
-                         "'tune' (96K cal, CPU 0x8000) / 'program-high' (128K, 0x20000) are "
-                         "directly BSL-reachable. 'boot' (8K, CPU 0x0 = reset VECTORS; firmware "
-                         "never erases these) / 'program-low' (8K, CPU 0x2000) / 'program-mid' "
-                         "(16K, CPU 0x4000 = chip's HW-LOCKED boot block, needs RP#=12V) live in "
-                         "the BSL-shadowed 0x0-0x7FFF and are auto-routed through the +0x40000 "
-                         "alias. 'all' = flash every block in one monitor session (needs a full "
-                         "image) — for a virgin/dead chip.")
+    fp = sub.add_parser("flash", help="erase+program+verify a region from a reference (DRY-RUN unless "
+                                      "--arm). 28F200 needs 12V on VPP/RP#; 29F200/29F400 are single-supply.")
+    fp.add_argument("region",
+                    choices=list(dict.fromkeys(list(FLASH_REGIONS) + list(FLASH_REGIONS_AMD)
+                                               + list(FLASH_REGIONS_AMD_LOWER))) + ["all"],
+                    help="erase region (CPU addrs; chip block = XOR 0x4000). Valid set depends on "
+                         "--chip. 28F200: 'tune'(96K)/'program-high'(128K) direct; 'boot'(8K, reset "
+                         "VECTORS)/'program-low'(8K)/'program-mid'(16K HW-locked, RP#=12V) in the "
+                         "BSL-shadowed 0x0-0x7FFF via the +0x40000 alias. 29F400 (A17-high upper half): "
+                         "'tune'(64K=SA8)/'program-high'(2x64K=SA9+SA10) direct; 'low' = SA7, the 64K "
+                         "sector at CPU 0x0-0xFFFF (low 32K = boot+program-low+bootloader; upper 32K = "
+                         "gap+hole), flashed as ONE unit via the +0x40000 alias (the whole 64K sector "
+                         "erases together). 29F200 (and 29F400 --half lower) = bottom-boot fine sectors: "
+                         "'boot'(8K=SA1, VECTORS)/'program-low'(8K=SA2)/'program-mid'(16K=SA0) separate "
+                         "via the alias, 'tune'(64K=SA4), 'program-high'(2x64K=SA5+SA6). 'all' = every "
+                         "region in one monitor session (needs a full image) — for a virgin/dead chip.")
     fp.add_argument("--ref", metavar="FILE", default=None,
                     help="reference to program from: a full file-order .bin (e.g. an exact-ECU "
                          "dump or corrected image) for any region, OR a 24KB cal partial (DS2 "

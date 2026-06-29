@@ -17,6 +17,10 @@ dist/
 *.bin
 flash_backup_*.bin
 
+# ── Third-party reference material — NOT redistributed ──────────────────
+# Local datasheets / manuals (vendor copyright). Credited in the README only.
+Reference Documents/
+
 # ── Logs & runtime output ───────────────────────────────────────────────
 *.log
 logs/
