@@ -84,7 +84,7 @@ erase individually (no 64 KB group erase), matching the 28F200's region names.
 > held high by a pull-up) as a decode input: the SRAM and CAN chip-selects are gated by it, so
 > simply tying A17 **low** deasserts RAM/CAN and **kills the ECU**. To use `--half lower` on a
 > 29F400 you must first **either reprogram the GAL** so its decode no longer depends on A17, **or
-> cut the trace between flash pin 3 (A17) and the GAL** so the GAL keeps seeing the high it expects
+> cut the trace between flash pin 3 (A17) and the GAL before the pull-up resistor** so the GAL keeps seeing the high it expects
 > while A17 alone is pulled low. A genuine **29F200 needs none of this** — it has no A17 pin. Note
 > that selecting the lower half points the CPU at a (possibly blank) half, so the image must
 > already be present there.
