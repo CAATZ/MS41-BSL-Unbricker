@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project uses
 [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`).
 
+## [1.2.0] — 2026-07-01
+
+### Fixed
+- **Variant / hybrid guard** — `detect_program_variant` used the cal-resident `ABHISHEK`
+  marker (file `0x11F60` = cal `0x5F60`, overwritten by a tune write) as if it identified the
+  program, so `check_hybrid` could pass an incompatible program+cal ROM as consistent
+  (byte-proven: MS41.2↔MS41.3 and cross-family-with-MS41.3-cal hybrids returned "not hybrid").
+  Now uses a genuine program-region SS1v2 marker (program tail `0x39A9A-0x39B69`, blank in
+  stock MS41.2) — catches cross-family (brick risk) and MS41.2↔MS41.3 mismatches.
+- **Flash byte-order guard** — `flash` refuses a full `--ref` that is CPU/physical order rather
+  than file/chip order (CAL-ID at `0x1000E` vs `0x1400E`); flashing that would double-scramble
+  and brick the ECU. Override with `--force`.
+
+### Changed
+- **`dump` default is now file/chip order** (bench-flashable). Use `--cpu-order` for the raw
+  physical/CPU image (not directly re-flashable); `--file-order` is kept (now the default).
+- **`dump --partial`** — dump only the 24 KB cal/tune partition (DS2 `0x10000-0x15FFF`) in
+  CPU/DS2 order — a clean partial flashable via `flash tune --ref`.
+- Docs: a 24 KB `--ref` partial is CPU/DS2 order (DS2 `0x10000-0x15FFF`), **not** a file slice
+  `full[0x14000:0x1A000]`.
+
 ## [1.1.0] — 2026-06-28
 
 Adds in-circuit recovery of the AMD/JEDEC **29F200 / 29F400** flash family alongside the
@@ -40,7 +61,7 @@ verified; flash ID confirmed Intel 28F200BX-B.
 ### Added
 - **`flash <region|all>`** — erase + program + verify any block (`boot`, `program-low`,
   `program-mid`, `tune`, `program-high`) or the whole chip, from a full file-order image
-  or a 24 KB calibration partial. **Dry-run by default; `--arm` to execute.**
+  or a 24 KB calibration partial (CPU/DS2 order, not a file slice). **Dry-run by default; `--arm` to execute.**
 - **Variant guard** — refuses a cross-variant calibration; allows a blank/virgin chip.
 - **Checksum guard** — verifies boot/program/cal checksums, respects the ECU's disable
   switches (a bad-but-disabled checksum only warns), `--fix-checksums` to correct,
@@ -53,5 +74,6 @@ verified; flash ID confirmed Intel 28F200BX-B.
   progress bars, and FT232-stall auto-recovery.
 - `--version`.
 
+[1.2.0]: https://semver.org/
 [1.1.0]: https://semver.org/
 [1.0.0]: https://semver.org/

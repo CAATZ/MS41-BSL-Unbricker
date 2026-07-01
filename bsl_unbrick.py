@@ -53,7 +53,7 @@ try:
 except ImportError:
     cks = None
 
-__version__ = "1.1.0"                   # bump on each release; tag the commit v<version> (see CHANGELOG.md)
+__version__ = "1.2.0"                   # bump on each release; tag the commit v<version> (see CHANGELOG.md)
 
 CAL_PARTIAL_SIZE = 24 * 1024           # a 24KB cal/tune partial (DS2 0x10000.., CPU-order)
 _SERIAL_ERRS = (serial.SerialException,) if serial else ()   # for top-level FT232 handling
@@ -629,6 +629,15 @@ def cmd_dump(args):
     bsl = _monitor(args)
     if not bsl:
         return 1
+    if getattr(args, "partial", False):
+        lo, hi = 0x10000, 0x16000       # DS2 0x10000-0x15FFF = the 24 KB cal/tune partition
+        print(f"dumping the 24 KB cal/tune partial (DS2 0x{lo:05X}-0x{hi - 1:05X}, CPU/DS2 order)…")
+        data = bsl.mon_dump(lo, hi, alias_low=False, fill_hole=False)   # tune has no hole; no swap
+        with open(args.file, "wb") as f:
+            f.write(bytes(data))
+        print(f"RESULT: wrote {len(data)} bytes (24 KB CPU-order cal partial) to {args.file} — "
+              f"flash it with `flash tune --ref {args.file}`.")
+        return 0
     start, end = 0x0, 0x40000           # whole chip by default
     if args.range:
         s, _, e = args.range.partition(":")
@@ -666,12 +675,14 @@ def cmd_dump(args):
     data = bsl.mon_dump(start, end, alias_low=alias_low, fill_hole=not args.raw_hole)
     full = bytearray(b"\xff" * end)                 # physical/CPU-indexed image
     full[start:end] = data
-    order = "physical/CPU"
-    if args.file_order:
+    # Default is file/chip order (bench-flashable, standard .bin); --cpu-order keeps the raw image.
+    if args.cpu_order:
+        order = "physical/CPU (raw — NOT directly re-flashable; omit --cpu-order for a flashable .bin)"
+    else:
         if end % 0x8000:
-            print(f"  NOTE: --file-order needs a 0x8000-aligned end (0x{end:X} isn't); the "
-                  f"trailing odd 16KB block can't be paired.")
-        full = bytearray(_swap_block_order(full))   # -> file / chip-physical order
+            print(f"  NOTE: file-order needs a 0x8000-aligned end (0x{end:X} isn't); the trailing "
+                  f"odd 16KB block can't be paired — pass --cpu-order for a raw dump.")
+        full = bytearray(_swap_block_order(full))   # CPU/physical -> file/chip-physical order
         order = "file/chip-physical (bench-flashable)"
     with open(args.file, "wb") as f:
         f.write(full)
@@ -1240,6 +1251,19 @@ def cmd_flash(args):
     except OSError as e:
         print(f"cannot open --ref: {e}"); return 2
 
+    # Byte-order guard: a FULL ref must be FILE/chip order — the writer descrambles it to
+    # CPU/physical.  A CPU-order image (e.g. a `dump --cpu-order`) would be double-scrambled
+    # and brick the ECU.  (Only fulls: a 24 KB partial is CPU-order by design and is skipped.)
+    if MS41ECU and len(ref) == MS41ECU.FULL_ROM_SIZE and MS41ECU.looks_cpu_order(ref):
+        print("REFUSING: --ref looks CPU/physical order, not file/chip order (its CAL-ID is at "
+              "0x1000E, not 0x1400E). The flasher descrambles a FILE-order image, so flashing this "
+              "as-is would double-scramble and BRICK the ECU.")
+        print("  Fix: if you made it with `dump`, the default is file-order — re-dump WITHOUT "
+              "--cpu-order (or `dump --file-order`).")
+        if not args.force:
+            return 2
+        print("  --force given: proceeding anyway (you asserted the image is already file-order).")
+
     amd, regions_map, chip_label = _flash_profile(args.chip, args.half)
     print(f"== FLASH CHIP: {chip_label} ==")
     if args.chip == "auto":
@@ -1385,8 +1409,14 @@ def main():
     dp.add_argument("--range", metavar="START:END", default=None,
                     help="physical range to dump (default the whole chip 0x0:0x40000)")
     dp.add_argument("--file-order", action="store_true",
-                    help="save in file/chip order (block-swap XOR 0x4000) so the dump is a "
-                         "bench-flashable .bin; default is raw physical/CPU order")
+                    help="(now the DEFAULT) save in file/chip order (block-swap XOR 0x4000) — a "
+                         "bench-flashable .bin; kept for explicitness / back-compat")
+    dp.add_argument("--cpu-order", action="store_true",
+                    help="save the raw physical/CPU-order image instead (NOT directly re-flashable — "
+                         "the flasher would double-scramble it)")
+    dp.add_argument("--partial", action="store_true",
+                    help="dump ONLY the 24 KB cal/tune partition (DS2 0x10000-0x15FFF), CPU/DS2 "
+                         "order — a clean partial flashable via `flash tune --ref`")
     dp.add_argument("--no-alias", action="store_true",
                     help="do NOT route the BSL-shadowed 0x0-0x7FFF through the +0x40000 alias")
     dp.add_argument("--raw-hole", action="store_true",

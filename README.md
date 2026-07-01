@@ -160,8 +160,10 @@ python bsl_unbrick.py --port COM4 --reset-line dtr sync
 # identify the flash chip (manufacturer + device ID; non-destructive, no 12V)
 python bsl_unbrick.py --port COM4 --reset-line dtr id
 
-# dump the whole chip to a file-order .bin (bench-flashable layout)
-python bsl_unbrick.py --port COM4 --reset-line dtr dump dump.bin --file-order
+# dump the whole chip to a file-order .bin (bench-flashable layout — now the DEFAULT)
+python bsl_unbrick.py --port COM4 --reset-line dtr dump dump.bin
+#   ...add --cpu-order for the raw physical/CPU image (NOT directly re-flashable)
+#   ...or --partial to dump just the 24 KB cal/tune partition (flashable via `flash tune`)
 
 # preview a flash — DRY RUN: prints the plan, opens nothing, touches nothing
 python bsl_unbrick.py --port COM4 --reset-line dtr flash tune --ref image.bin
@@ -186,7 +188,9 @@ python bsl_unbrick.py --port COM4 --reset-line dtr --chip 29f400 --half lower fl
   `29f200`/`29f400` (AMD/JEDEC, no 12 V). Default `auto` assumes 28F200 for `flash`. See
   *Flash chip & regions* above (the AMD chips use a different region map).
 - **`--ref`** is a full file-order 256 KB image for any region, **or** a 24 KB
-  calibration partial for `tune`.
+  calibration partial for `tune` — the partial is **CPU/DS2 order** (DS2 `0x10000–0x15FFF`),
+  **not** a file slice `full[0x14000:0x1A000]` (that layout drops the swapped-half cal —
+  file = CPU XOR `0x4000` per 16 KB). A partial this tool reads back is already correct.
 - **`--speed slow|mid|fast`** = 9600 / 19200 / 38400 baud. The ECU's bootstrap
   auto-baud sets the ceiling; `mid` (19200) is the reliable sweet spot. If a faster
   preset returns a garbled sync, drop down one.

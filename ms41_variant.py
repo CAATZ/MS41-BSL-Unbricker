@@ -29,11 +29,20 @@ MS41_3_MARKER_PREFIX = b"SS1"
 # BMW DME ECU ID — 7 ASCII digits at 0x6025 (full ROM only).
 ECU_ID_ADDR = 0x6025
 
-# MS41.3 program-region identity marker (outside the calibration area, so a
-# calibration-only edit can't forge it) — lets check_hybrid catch a ROM whose
-# program and calibration come from different variants.
+# MS41.3 identity marker (developer credit "ABHISHEK").  ⚠ CAL-RESIDENT: file 0x11F60 =
+# DS2 0x15F60 = cal 0x5F60, inside the tune partition (DS2 0x10000-0x15FFF) — a tune write
+# overwrites it.  A reliable MS41.3 DISCRIMINATOR but cal-based; kept for reference.  For the
+# PROGRAM half use MS41_3_PROG_CODE_RANGE below (a genuine program-region marker).
 MS41_3_PROG_MARKER_ADDR   = 0x11F60
 MS41_3_PROG_MARKER_STRING = b"ABHISHEK"
+
+# ★ TRUE program-region MS41.3 marker: SS1v2 fills the program tail 0x39A9A-0x39B69 with code
+# where stock MS41.2 leaves 0xFF.  It lives in the PROGRAM sector (SA5/6), so a cal/tune flash
+# never touches it — unlike ABHISHEK it identifies the PROGRAM half and survives a cal reflash.
+# Ends at 0x39B6A (clear of add-on code caves).  ⚠ Validated against MS41.2 and MS41.3 reads so
+# far — widen against more stock images before trusting blindly.
+MS41_3_PROG_CODE_RANGE = (0x39A9A, 0x39B6A)   # [lo, hi) file offsets
+MS41_3_PROG_CODE_MIN   = 64                    # non-FF bytes to call it SS1v2 (.2 -> 0, .3 -> 208)
 
 # Program-region ECU IDs that map to a known variant.
 _PROG_ECU_ID_MAP = {
@@ -90,30 +99,69 @@ class MS41ECU:
         return None
 
     @staticmethod
+    def has_ss1v2_program(data):
+        """True if the program tail carries SS1v2 code — the genuine MS41.3 PROGRAM marker.
+        Stock MS41.2 leaves MS41_3_PROG_CODE_RANGE (file 0x39A9A-0x39B69) as 0xFF; SS1v2 fills
+        it with ~208 B of code.  In the program sector (SA5/6), so a cal/tune flash never
+        touches it — this identifies the PROGRAM half, not the cal."""
+        lo, hi = MS41_3_PROG_CODE_RANGE
+        if len(data) < hi:
+            return False
+        return sum(1 for i in range(lo, hi) if data[i] != 0xFF) >= MS41_3_PROG_CODE_MIN
+
+    @staticmethod
     def detect_program_variant(data):
         """Detect the variant of the PROGRAM region of a 256 KB full ROM, or None.
-        Reads only outside the calibration area, so it identifies the program even
-        in a hybrid ROM whose program and calibration are different variants."""
+
+        MS41.3 is detected by the genuine program-region SS1v2 marker (has_ss1v2_program);
+        every other variant maps the ECU ID (file 0x6025, boot/param).  Both are true
+        program-region reads (unaffected by a cal reflash) — unlike the cal-resident ABHISHEK
+        proxy this actually identifies the PROGRAM half.  (MS41.3 shares MS41.2's ECU ID
+        1406464, so the ECU-ID fallback alone would report .3 programs as .2 — the program-code
+        marker is what separates them.)"""
         if len(data) < MS41ECU.FULL_ROM_SIZE:
             return None
-        end = MS41_3_PROG_MARKER_ADDR + len(MS41_3_PROG_MARKER_STRING)
-        if bytes(data[MS41_3_PROG_MARKER_ADDR:end]) == MS41_3_PROG_MARKER_STRING:
+        if MS41ECU.has_ss1v2_program(data):
             return "MS41.3"
         return _PROG_ECU_ID_MAP.get(MS41ECU.read_ecu_id(data))
 
     @staticmethod
     def check_hybrid(data):
-        """Return a description string if a 256 KB ROM mixes program and calibration
-        from incompatible variants (flashing such a ROM bricks the ECU), else None
-        (consistent, or not identifiable)."""
+        """Return a description string if a 256 KB ROM mixes program and calibration from
+        incompatible variants, else None (consistent, or not identifiable).
+
+        Cross-FAMILY pairings (MS41.0/.1 vs .2/.3) brick the ECU; an MS41.2<->MS41.3 mismatch
+        mis-runs (the .3 program expects SS1v2 cal features the .2 cal lacks, and vice-versa).
+        Catches BOTH via the genuine program-region SS1v2 marker (detect_program_variant) vs
+        the SS1 cal marker (detect_variant) — the old cal-resident ABHISHEK proxy missed
+        cross-family-with-.3-cal and all MS41.2<->MS41.3 hybrids."""
         if len(data) < MS41ECU.FULL_ROM_SIZE:
             return None
-        prog_v = MS41ECU.detect_program_variant(data)
-        cal_v = MS41ECU.detect_variant(data)
+        prog_v = MS41ECU.detect_program_variant(data)   # genuine program-region read
+        cal_v = MS41ECU.detect_variant(data)            # cal (SS1 marker / CAL ID)
         if prog_v is None or cal_v is None or prog_v == cal_v:
             return None
         pf = _VARIANT_FAMILY.get(prog_v, "?")
         cf = _VARIANT_FAMILY.get(cal_v, "?")
-        kind = "cross-family" if pf != cf else "cross-variant within same family"
+        kind = "cross-family (brick risk)" if pf != cf else "MS41.2/.3 program-cal mismatch"
         return (f"Program region: {prog_v} ({pf})  -  "
                 f"Calibration region: {cal_v} ({cf})  [{kind}]")
+
+    @staticmethod
+    def looks_cpu_order(data):
+        """True if a 256 KB image appears to be CPU/physical order (byte-swapped per 16 KB)
+        instead of the expected file/chip order — e.g. a `dump` taken with --cpu-order.
+
+        Such an image must NOT be flashed: the writer descrambles a FILE-order ref, so a
+        CPU-order ref would be double-scrambled and brick the ECU.  Signal: the CAL-ID sits at
+        the CPU-order offset 0x1000E (= 0x1400E XOR 0x4000) and NOT at the file-order 0x1400E.
+        Conservative — a valid file-order full always has its CAL-ID at 0x1400E, so it is never
+        flagged (no false positives)."""
+        if len(data) != MS41ECU.FULL_ROM_SIZE:
+            return False
+
+        def _is_calid(off):
+            c = bytes(data[off:off + 8])
+            return len(c) == 8 and all(0x30 <= b <= 0x7E for b in c) and c[:2].isdigit()
+
+        return _is_calid(0x1000E) and not _is_calid(0x1400E)
